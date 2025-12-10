@@ -4,7 +4,7 @@ using Microsoft.SemanticKernel.Connectors.OpenAI;
 
 using NewLife.Log;
 
-namespace DH.ApiGateWay;
+namespace Pek.AI;
 
 /// <summary>
 /// 阿里百炼AI服务

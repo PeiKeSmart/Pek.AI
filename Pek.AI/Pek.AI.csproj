@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFrameworks>net9.0;net10.0</TargetFrameworks>
-    <RootNamespace>DH.ApiGateWay</RootNamespace>
+    <RootNamespace>Pek.AI</RootNamespace>
     <AssemblyTitle>AI通用库</AssemblyTitle>
     <Description>基于DH框架的AI通用库</Description>
     <Company>湖北登灏科技有限公司</Company>
