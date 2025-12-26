@@ -85,6 +85,81 @@ public class BaiLianService
     }
 
     /// <summary>
+    /// 带图片的流式对话 - 支持视觉模型
+    /// </summary>
+    /// <param name="message">文本消息</param>
+    /// <param name="imageUrl">图片URL</param>
+    public async IAsyncEnumerable<String> ChatWithImageStreamAsync(String message, String imageUrl)
+    {
+        var chatHistory = new ChatHistory();
+        
+        // 创建包含图片的消息
+        var messageContent = new ChatMessageContentItemCollection
+        {
+            new TextContent(message),
+            new ImageContent(new Uri(imageUrl))
+        };
+        
+        chatHistory.AddUserMessage(messageContent);
+
+        await foreach (var chunk in _chatService.GetStreamingChatMessageContentsAsync(chatHistory).ConfigureAwait(false))
+        {
+            if (!String.IsNullOrEmpty(chunk.Content))
+            {
+                yield return chunk.Content;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 带本地图片的流式对话 - 支持视觉模型
+    /// </summary>
+    /// <param name="message">文本消息</param>
+    /// <param name="imagePath">本地图片路径</param>
+    public async IAsyncEnumerable<String> ChatWithLocalImageStreamAsync(String message, String imagePath)
+    {
+        if (!File.Exists(imagePath))
+        {
+            throw new FileNotFoundException($"图片文件不存在: {imagePath}");
+        }
+
+        // 读取图片并转换为Base64
+        var imageBytes = await File.ReadAllBytesAsync(imagePath).ConfigureAwait(false);
+        var base64Image = Convert.ToBase64String(imageBytes);
+        
+        // 获取图片格式
+        var extension = Path.GetExtension(imagePath).ToLowerInvariant();
+        var mimeType = extension switch
+        {
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".png" => "image/png",
+            ".gif" => "image/gif",
+            ".webp" => "image/webp",
+            _ => "image/jpeg"
+        };
+
+        var chatHistory = new ChatHistory();
+        
+        // 使用 BinaryData 创建图片内容
+        var imageContent = new ImageContent(new BinaryData(imageBytes), mimeType);
+        var messageContent = new ChatMessageContentItemCollection
+        {
+            new TextContent(message),
+            imageContent
+        };
+        
+        chatHistory.AddUserMessage(messageContent);
+
+        await foreach (var chunk in _chatService.GetStreamingChatMessageContentsAsync(chatHistory).ConfigureAwait(false))
+        {
+            if (!String.IsNullOrEmpty(chunk.Content))
+            {
+                yield return chunk.Content;
+            }
+        }
+    }
+
+    /// <summary>
     /// 使用插件进行函数调用
     /// </summary>
     public async Task<String> ChatWithPluginAsync(String message, params Object[] plugins)
