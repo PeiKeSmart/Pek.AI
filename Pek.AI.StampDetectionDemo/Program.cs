@@ -259,10 +259,24 @@ internal sealed class OpenCvSealCandidateDetector
 {
     public IReadOnlyList<SealDetection> Detect(Mat source)
     {
+        var detections = new List<SealDetection>();
+
+        using var redMask = BuildRedSealMask(source);
+        detections.AddRange(DetectFromMask(source, redMask, channelName: "opencv-red", allowPartial: true));
+
+        using var neutralMask = BuildNeutralSealMask(source);
+        detections.AddRange(DetectFromMask(source, neutralMask, channelName: "opencv-neutral", allowPartial: true));
+
+        var filtered = NonMaxSuppression.Apply(detections, 0.3f);
+        return MergeNearbyDetections(filtered, source.Width, source.Height);
+    }
+
+    private static Mat BuildRedSealMask(Mat source)
+    {
         using var hsv = new Mat();
         using var mask1 = new Mat();
         using var mask2 = new Mat();
-        using var mask = new Mat();
+        var mask = new Mat();
         using var morph = new Mat();
 
         Cv2.CvtColor(source, hsv, ColorConversionCodes.BGR2HSV);
@@ -273,15 +287,48 @@ internal sealed class OpenCvSealCandidateDetector
         using var kernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new Size(5, 5));
         Cv2.MorphologyEx(mask, morph, MorphTypes.Close, kernel, iterations: 2);
         Cv2.MorphologyEx(morph, morph, MorphTypes.Open, kernel, iterations: 1);
+        morph.CopyTo(mask);
+        return mask;
+    }
 
-        Cv2.FindContours(morph, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+    private static Mat BuildNeutralSealMask(Mat source)
+    {
+        using var gray = new Mat();
+        using var blur = new Mat();
+        using var adaptive = new Mat();
+        using var edges = new Mat();
+        using var gradient = new Mat();
+        using var texture = new Mat();
+        using var merged = new Mat();
+        var mask = new Mat();
+
+        Cv2.CvtColor(source, gray, ColorConversionCodes.BGR2GRAY);
+        Cv2.GaussianBlur(gray, blur, new Size(5, 5), 0);
+        Cv2.AdaptiveThreshold(blur, adaptive, 255, AdaptiveThresholdTypes.GaussianC, ThresholdTypes.BinaryInv, 31, 8);
+        Cv2.Canny(blur, edges, 60, 180);
+        Cv2.Laplacian(blur, gradient, MatType.CV_8U, 3);
+        Cv2.Threshold(gradient, texture, 24, 255, ThresholdTypes.Binary);
+        Cv2.BitwiseOr(adaptive, edges, merged);
+        Cv2.BitwiseOr(merged, texture, mask);
+
+        using var kernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new Size(5, 5));
+        Cv2.MorphologyEx(mask, mask, MorphTypes.Close, kernel, iterations: 2);
+        Cv2.MorphologyEx(mask, mask, MorphTypes.Open, kernel, iterations: 1);
+        Cv2.Dilate(mask, mask, kernel, iterations: 1);
+
+        return mask;
+    }
+
+    private static IReadOnlyList<SealDetection> DetectFromMask(Mat source, Mat mask, String channelName, Boolean allowPartial)
+    {
+        Cv2.FindContours(mask, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
         var detections = new List<SealDetection>();
         var imageArea = source.Width * source.Height;
 
         foreach (var contour in contours)
         {
             var area = Cv2.ContourArea(contour);
-            if (area < 200 || area > imageArea * 0.3)
+            if (area < 120 || area > imageArea * 0.35)
                 continue;
 
             var perimeter = Cv2.ArcLength(contour, true);
@@ -291,17 +338,130 @@ internal sealed class OpenCvSealCandidateDetector
             var circularity = 4 * Math.PI * area / (perimeter * perimeter);
             var rect = Cv2.BoundingRect(contour);
             var aspectRatio = rect.Width / (Single)Math.Max(1, rect.Height);
-            if (aspectRatio is < 0.35f or > 3.2f)
+            if (aspectRatio is < 0.22f or > 4.5f)
                 continue;
 
-            if (circularity < 0.15 && aspectRatio is < 0.8f or > 1.25f)
+            var rectArea = rect.Width * rect.Height;
+            if (rectArea <= 0)
                 continue;
 
-            var score = Math.Min(0.95f, (Single)(0.35 + circularity * 0.5));
-            detections.Add(new SealDetection(rect, score, 0, "seal", "opencv"));
+            var fillRatio = (Single)(area / rectArea);
+            var touchesEdge = TouchesImageEdge(rect, source.Width, source.Height);
+            var partialCandidate = allowPartial && (touchesEdge || circularity < 0.22 || fillRatio < 0.2f);
+
+            if (!partialCandidate && circularity < 0.12 && (aspectRatio < 0.7f || aspectRatio > 1.4f))
+                continue;
+
+            if (partialCandidate && fillRatio < 0.06f)
+                continue;
+
+            var roi = new Mat(source, rect);
+            var edgeDensity = ComputeEdgeDensity(roi);
+            var strokeDensity = ComputeStrokeDensity(mask, rect);
+            if (edgeDensity < 0.015f && strokeDensity < 0.04f)
+                continue;
+
+            var score = 0.2f;
+            score += MathF.Min(0.3f, MathF.Max(0f, (Single)circularity * 0.35f));
+            score += MathF.Min(0.2f, fillRatio * 0.3f);
+            score += MathF.Min(0.2f, edgeDensity * 1.4f);
+            score += MathF.Min(0.2f, strokeDensity * 0.8f);
+            if (partialCandidate)
+                score = MathF.Max(score, 0.38f);
+
+            detections.Add(new SealDetection(rect, MathF.Min(0.95f, score), 0, partialCandidate ? "partial-seal" : "seal", channelName));
         }
 
-        return NonMaxSuppression.Apply(detections, 0.3f);
+        return detections;
+    }
+
+    private static Boolean TouchesImageEdge(Rect rect, Int32 width, Int32 height)
+    {
+        const Int32 tolerance = 6;
+        return rect.Left <= tolerance || rect.Top <= tolerance || rect.Right >= width - tolerance || rect.Bottom >= height - tolerance;
+    }
+
+    private static Single ComputeEdgeDensity(Mat roi)
+    {
+        using var gray = new Mat();
+        using var edges = new Mat();
+        Cv2.CvtColor(roi, gray, ColorConversionCodes.BGR2GRAY);
+        Cv2.Canny(gray, edges, 50, 150);
+        return Cv2.CountNonZero(edges) / (Single)Math.Max(1, roi.Width * roi.Height);
+    }
+
+    private static Single ComputeStrokeDensity(Mat mask, Rect rect)
+    {
+        using var roi = new Mat(mask, rect);
+        return Cv2.CountNonZero(roi) / (Single)Math.Max(1, rect.Width * rect.Height);
+    }
+
+    private static IReadOnlyList<SealDetection> MergeNearbyDetections(IReadOnlyList<SealDetection> detections, Int32 imageWidth, Int32 imageHeight)
+    {
+        if (detections.Count <= 1)
+            return detections;
+
+        var pending = detections.ToList();
+        var merged = true;
+
+        while (merged)
+        {
+            merged = false;
+
+            for (var firstIndex = 0; firstIndex < pending.Count && !merged; firstIndex++)
+            {
+                for (var secondIndex = firstIndex + 1; secondIndex < pending.Count; secondIndex++)
+                {
+                    if (!ShouldMerge(pending[firstIndex], pending[secondIndex]))
+                        continue;
+
+                    pending[firstIndex] = MergeDetection(pending[firstIndex], pending[secondIndex], imageWidth, imageHeight);
+                    pending.RemoveAt(secondIndex);
+                    merged = true;
+                    break;
+                }
+            }
+        }
+
+        return pending;
+    }
+
+    private static Boolean ShouldMerge(SealDetection first, SealDetection second)
+    {
+        var union = Union(first.Box, second.Box);
+        var maxWidth = Math.Max(first.Box.Width, second.Box.Width);
+        var maxHeight = Math.Max(first.Box.Height, second.Box.Height);
+        var gapX = Math.Max(0, Math.Max(first.Box.Left, second.Box.Left) - Math.Min(first.Box.Right, second.Box.Right));
+        var gapY = Math.Max(0, Math.Max(first.Box.Top, second.Box.Top) - Math.Min(first.Box.Bottom, second.Box.Bottom));
+        var centerDeltaX = Math.Abs((first.Box.Left + first.Box.Right) - (second.Box.Left + second.Box.Right)) / 2f;
+        var centerDeltaY = Math.Abs((first.Box.Top + first.Box.Bottom) - (second.Box.Top + second.Box.Bottom)) / 2f;
+        var closeEnough = gapX <= maxWidth * 0.6f && gapY <= maxHeight * 0.6f;
+        var sameNeighborhood = centerDeltaX <= union.Width * 0.75f && centerDeltaY <= union.Height * 0.75f;
+        var reasonableUnion = union.Width <= maxWidth * 1.8f && union.Height <= maxHeight * 1.8f;
+        return closeEnough && sameNeighborhood && reasonableUnion;
+    }
+
+    private static SealDetection MergeDetection(SealDetection first, SealDetection second, Int32 imageWidth, Int32 imageHeight)
+    {
+        var union = Union(first.Box, second.Box);
+        var bounded = new Rect(
+            Math.Max(0, union.X),
+            Math.Max(0, union.Y),
+            Math.Min(imageWidth - Math.Max(0, union.X), union.Width),
+            Math.Min(imageHeight - Math.Max(0, union.Y), union.Height));
+        var score = MathF.Max(first.Score, second.Score);
+        var label = first.Label == "partial-seal" || second.Label == "partial-seal" ? "partial-seal" : "seal";
+        var source = first.Source == second.Source ? first.Source : $"{first.Source}+{second.Source}";
+        return new SealDetection(bounded, score, first.ClassId, label, source);
+    }
+
+    private static Rect Union(Rect first, Rect second)
+    {
+        var left = Math.Min(first.Left, second.Left);
+        var top = Math.Min(first.Top, second.Top);
+        var right = Math.Max(first.Right, second.Right);
+        var bottom = Math.Max(first.Bottom, second.Bottom);
+        return new Rect(left, top, right - left, bottom - top);
     }
 }
 
