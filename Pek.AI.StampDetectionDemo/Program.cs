@@ -330,7 +330,7 @@ internal sealed class StampDetectionPipeline
                 item.Area,
                 Circularity = (Single)(4 * Math.PI * item.Area / (item.Perimeter * item.Perimeter))
             })
-            .Where(item => item.Rect.IntersectsWith(focusWindow) || ContainsPoint(item.Rect, focusCenter))
+            .Where(item => MatchesFullRedDisplayContour(item.Rect, focusCenter, focusWindow, detectionBox))
             .Where(item => item.Circularity >= 0.03f)
             .OrderByDescending(item => ScoreFullRedDisplayContour(item.Rect, item.Area, item.Circularity, focusCenter, focusWindow))
             .Take(3)
@@ -526,6 +526,26 @@ internal sealed class StampDetectionPipeline
         var overlapBonus = ComputeRectIouLocal(contourRect, focusWindow) * 4f;
         var distancePenalty = DistanceToRectCenter(contourRect, focusCenter) / Math.Max(24f, MathF.Max(focusWindow.Width, focusWindow.Height) * 0.4f);
         return areaBonus + circularityBonus + overlapBonus - distancePenalty;
+    }
+
+    private static Boolean MatchesFullRedDisplayContour(Rect contourRect, Point2f focusCenter, Rect focusWindow, Rect detectionBox)
+    {
+        if (!contourRect.IntersectsWith(focusWindow) && !ContainsPoint(contourRect, focusCenter))
+            return false;
+
+        var contourCenterX = contourRect.X + contourRect.Width / 2f;
+        var contourCenterY = contourRect.Y + contourRect.Height / 2f;
+        var allowedCenterDeltaX = Math.Max(28f, detectionBox.Width * 0.42f);
+        var allowedCenterDeltaY = Math.Max(28f, detectionBox.Height * 0.42f);
+        if (Math.Abs(contourCenterX - focusCenter.X) > allowedCenterDeltaX || Math.Abs(contourCenterY - focusCenter.Y) > allowedCenterDeltaY)
+            return false;
+
+        var maxAllowedWidth = Math.Max(detectionBox.Width * 1.2f, detectionBox.Width + 20f);
+        var maxAllowedHeight = Math.Max(detectionBox.Height * 1.2f, detectionBox.Height + 20f);
+        if (contourRect.Width > maxAllowedWidth || contourRect.Height > maxAllowedHeight)
+            return false;
+
+        return true;
     }
 
     private static Boolean ContainsPoint(Rect rect, Point2f point)
