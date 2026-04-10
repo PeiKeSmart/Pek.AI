@@ -29,6 +29,7 @@ internal sealed class MainForm : Form
     private static readonly String[] SupportedExtensions = [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"];
 
     private readonly ListBox _imageListBox;
+    private readonly SplitContainer _mainSplit;
     private readonly AnnotationCanvas _canvas;
     private readonly ComboBox _classComboBox;
     private readonly CheckBox _autoSaveCheckBox;
@@ -40,6 +41,8 @@ internal sealed class MainForm : Form
     private readonly TextBox _trainBatchTextBox;
     private readonly TextBox _trainImageSizeTextBox;
     private readonly TextBox _trainDeviceTextBox;
+    private readonly Button _trainButton;
+    private readonly TextBox _trainLogTextBox;
     private readonly Label _statusLabel;
     private readonly StampPreAnnotationDetector _preAnnotationDetector = new();
     private readonly Dictionary<String, AnnotationDocument> _documents = new(StringComparer.OrdinalIgnoreCase);
@@ -51,6 +54,7 @@ internal sealed class MainForm : Form
     private List<String> _labels = ["seal", "partial-seal"];
     private Boolean _suppressImageSelectionChanged;
     private Boolean _isTraining;
+    private Boolean _initialLeftPanelApplied;
 
     public MainForm()
     {
@@ -60,14 +64,15 @@ internal sealed class MainForm : Form
         MinimumSize = new Size(1100, 760);
         KeyPreview = true;
 
-        var mainSplit = new SplitContainer
+        _mainSplit = new SplitContainer
         {
             Dock = DockStyle.Fill,
-            SplitterDistance = 430,
-            Panel1MinSize = 420,
+            SplitterDistance = 560,
+            Panel1MinSize = 520,
             FixedPanel = FixedPanel.Panel1
         };
-        Controls.Add(mainSplit);
+        Controls.Add(_mainSplit);
+        Shown += (_, _) => EnsureInitialLeftPanelWidth();
 
         var leftLayout = new TableLayoutPanel
         {
@@ -82,7 +87,7 @@ internal sealed class MainForm : Form
         leftLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         leftLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         leftLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        mainSplit.Panel1.Controls.Add(leftLayout);
+        _mainSplit.Panel1.Controls.Add(leftLayout);
 
         var openButton = new Button { Text = "打开图片目录", Dock = DockStyle.Top, Height = 38, AutoSize = false, Width = 180 };
         openButton.Click += (_, _) => OpenImageFolder();
@@ -194,9 +199,9 @@ internal sealed class MainForm : Form
         trainLayout.Controls.Add(imageDevicePanel, 1, 2);
         _openOnnxAfterTrainCheckBox = new CheckBox { Text = "训练完成后自动填入 best.onnx", AutoSize = true, Checked = true, Margin = new Padding(0, 8, 0, 0) };
         trainLayout.Controls.Add(_openOnnxAfterTrainCheckBox, 1, 3);
-        var trainButton = new Button { Text = "训练并导出 ONNX", AutoSize = false, Width = 180, Height = 34, Margin = new Padding(0, 8, 0, 0) };
-        trainButton.Click += async (_, _) => await TrainAndExportOnnxAsync();
-        trainLayout.Controls.Add(trainButton, 1, 4);
+        _trainButton = new Button { Text = "训练并导出 ONNX", AutoSize = false, Width = 180, Height = 34, Margin = new Padding(0, 8, 0, 0) };
+        _trainButton.Click += async (_, _) => await TrainAndExportOnnxAsync();
+        trainLayout.Controls.Add(_trainButton, 1, 4);
         trainLayout.Controls.Add(new Label { Text = "说明：会先导出当前目录下的 yolo 数据集，再调用仓库内 train_yolo.py 训练并导出 ONNX。", AutoSize = true, Margin = new Padding(0, 8, 0, 0) }, 1, 5);
         trainGroup.Controls.Add(trainLayout);
         leftLayout.Controls.Add(trainGroup, 0, 5);
@@ -212,7 +217,7 @@ internal sealed class MainForm : Form
         rightLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         rightLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         rightLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        mainSplit.Panel2.Controls.Add(rightLayout);
+        _mainSplit.Panel2.Controls.Add(rightLayout);
 
         var toolPanel = new FlowLayoutPanel
         {
@@ -236,13 +241,26 @@ internal sealed class MainForm : Form
         _statusLabel = new Label { Text = "先打开一个图片目录开始标注。", AutoSize = true, Padding = new Padding(0, 8, 0, 4) };
         rightLayout.Controls.Add(_statusLabel, 0, 2);
 
+        _trainLogTextBox = new TextBox
+        {
+            Multiline = true,
+            ReadOnly = true,
+            ScrollBars = ScrollBars.Vertical,
+            Dock = DockStyle.Fill,
+            Height = 180,
+            Font = new Font("Consolas", 9F),
+            BackColor = Color.FromArgb(24, 24, 24),
+            ForeColor = Color.Gainsboro
+        };
+        rightLayout.Controls.Add(_trainLogTextBox, 0, 3);
+
         var footer = new Label
         {
             Text = "导出内容包含：每张图对应的 YOLO txt、labels.txt、dataset.yaml、annotations.json。当前 ONNX 推理端可直接读取 labels.txt。",
             AutoSize = true,
             Padding = new Padding(0, 0, 0, 8)
         };
-        rightLayout.Controls.Add(footer, 0, 3);
+        rightLayout.Controls.Add(footer, 0, 4);
 
         UpdateClassComboBox();
     }
@@ -876,13 +894,19 @@ internal sealed class MainForm : Form
 
         _isTraining = true;
         SetTrainingControlsEnabled(false);
+        ClearTrainingLog();
+        AppendTrainingLog($"[{DateTime.Now:HH:mm:ss}] 开始训练");
+        AppendTrainingLog($"数据集目录: {datasetFolder}");
+        AppendTrainingLog($"运行目录: {runRoot}");
+        AppendTrainingLog($"运行名称: {runName}");
         _statusLabel.Text = $"开始训练：数据集 {datasetFolder}，运行名 {runName}";
 
         try
         {
-            var processResult = await RunTrainingProcessAsync(trainingScriptPath, datasetFolder, runRoot, runName, baseModel, imageSize, epochs, batch, device);
+            var processResult = await RunTrainingProcessAsync(trainingScriptPath, datasetFolder, runRoot, runName, baseModel, imageSize, epochs, batch, device, AppendTrainingLog);
             if (processResult.ExitCode != 0)
             {
+                AppendTrainingLog($"[{DateTime.Now:HH:mm:ss}] 训练失败，退出码: {processResult.ExitCode}");
                 MessageBox.Show(this, processResult.Output, "训练失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 _statusLabel.Text = "训练失败，请查看错误输出。";
                 return;
@@ -893,10 +917,12 @@ internal sealed class MainForm : Form
             {
                 _modelPathTextBox.Text = onnxPath;
                 _statusLabel.Text = $"训练完成，已导出 ONNX：{onnxPath}";
+                AppendTrainingLog($"[{DateTime.Now:HH:mm:ss}] 训练完成，已生成: {onnxPath}");
             }
             else
             {
                 _statusLabel.Text = $"训练完成：{Path.Combine(runRoot, runName)}";
+                AppendTrainingLog($"[{DateTime.Now:HH:mm:ss}] 训练完成，输出目录: {Path.Combine(runRoot, runName)}");
             }
 
             MessageBox.Show(this, processResult.Output, "训练完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -921,13 +947,53 @@ internal sealed class MainForm : Form
         _trainImageSizeTextBox.Enabled = enabled;
         _trainDeviceTextBox.Enabled = enabled;
         _openOnnxAfterTrainCheckBox.Enabled = enabled;
+        _trainButton.Enabled = enabled;
+        _trainButton.Text = enabled ? "训练并导出 ONNX" : "训练中...";
     }
 
-    private static async Task<TrainingProcessResult> RunTrainingProcessAsync(String trainingScriptPath, String datasetFolder, String runRoot, String runName, String baseModel, Int32 imageSize, Int32 epochs, Int32 batch, String device)
+    private void ClearTrainingLog()
+    {
+        _trainLogTextBox.Clear();
+    }
+
+    private void AppendTrainingLog(String message)
+    {
+        if (String.IsNullOrWhiteSpace(message))
+            return;
+
+        if (InvokeRequired)
+        {
+            BeginInvoke(new Action<String>(AppendTrainingLog), message);
+            return;
+        }
+
+        _trainLogTextBox.AppendText(message + Environment.NewLine);
+        _trainLogTextBox.SelectionStart = _trainLogTextBox.TextLength;
+        _trainLogTextBox.ScrollToCaret();
+        _statusLabel.Text = message;
+    }
+
+    private void EnsureInitialLeftPanelWidth()
+    {
+        if (_initialLeftPanelApplied)
+            return;
+
+        _initialLeftPanelApplied = true;
+        BeginInvoke(new Action(() =>
+        {
+            if (Width >= 1200)
+                _mainSplit.SplitterDistance = 560;
+            else if (Width >= 1050)
+                _mainSplit.SplitterDistance = 500;
+        }));
+    }
+
+    private static async Task<TrainingProcessResult> RunTrainingProcessAsync(String trainingScriptPath, String datasetFolder, String runRoot, String runName, String baseModel, Int32 imageSize, Int32 epochs, Int32 batch, String device, Action<String>? logCallback)
     {
         var pythonLauncher = ResolvePythonLauncher();
         var datasetYamlPath = Path.Combine(datasetFolder, "dataset.yaml");
         var arguments = BuildTrainingArguments(pythonLauncher.ArgumentPrefix, trainingScriptPath, datasetYamlPath, runRoot, runName, baseModel, imageSize, epochs, batch, device);
+        logCallback?.Invoke($"使用解释器: {pythonLauncher.DisplayName}");
 
         var startInfo = new ProcessStartInfo
         {
@@ -947,12 +1013,18 @@ internal sealed class MainForm : Form
         process.OutputDataReceived += (_, args) =>
         {
             if (!String.IsNullOrWhiteSpace(args.Data))
+            {
+                logCallback?.Invoke(args.Data);
                 outputBuilder.AppendLine(args.Data);
+            }
         };
         process.ErrorDataReceived += (_, args) =>
         {
             if (!String.IsNullOrWhiteSpace(args.Data))
+            {
+                logCallback?.Invoke(args.Data);
                 outputBuilder.AppendLine(args.Data);
+            }
         };
 
         if (!process.Start())
@@ -2126,4 +2198,7 @@ internal sealed class OnnxPreAnnotationDetector : IDisposable
 
 internal sealed record TrainingProcessResult(Int32 ExitCode, String Output);
 
-internal sealed record TrainingPythonLauncher(String FileName, String ArgumentPrefix);
+internal sealed record TrainingPythonLauncher(String FileName, String ArgumentPrefix)
+{
+    public String DisplayName => String.IsNullOrWhiteSpace(ArgumentPrefix) ? FileName : $"{FileName} {ArgumentPrefix}";
+}
