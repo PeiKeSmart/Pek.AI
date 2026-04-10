@@ -994,12 +994,13 @@ internal sealed class MainForm : Form
         var datasetYamlPath = Path.Combine(datasetFolder, "dataset.yaml");
         var arguments = BuildTrainingArguments(pythonLauncher.ArgumentPrefix, trainingScriptPath, datasetYamlPath, runRoot, runName, baseModel, imageSize, epochs, batch, device);
         logCallback?.Invoke($"使用解释器: {pythonLauncher.DisplayName}");
+        logCallback?.Invoke($"基础模型: {baseModel}");
 
         var startInfo = new ProcessStartInfo
         {
             FileName = pythonLauncher.FileName,
             Arguments = arguments,
-            WorkingDirectory = Path.GetDirectoryName(trainingScriptPath)!,
+            WorkingDirectory = datasetFolder,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
@@ -1075,9 +1076,9 @@ internal sealed class MainForm : Form
         builder.Append('"');
         builder.Append(" --data \"");
         builder.Append(datasetYamlPath);
-        builder.Append("\" --model ");
+        builder.Append("\" --model \"");
         builder.Append(baseModel);
-        builder.Append(" --imgsz ");
+        builder.Append("\" --imgsz ");
         builder.Append(imageSize.ToString(CultureInfo.InvariantCulture));
         builder.Append(" --epochs ");
         builder.Append(epochs.ToString(CultureInfo.InvariantCulture));
