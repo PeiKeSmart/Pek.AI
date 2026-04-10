@@ -280,25 +280,17 @@ internal sealed class StampDetectionPipeline
         if (!detection.Source.Contains("opencv-red", StringComparison.OrdinalIgnoreCase))
             return detection.Box;
 
-        if (detection.Label == "partial-seal")
-            return TryFitSealDisplayRect(image, detection.Box, out var partialRect) ? partialRect : detection.Box;
-
-        return TryFitFullRedSealDisplayRect(image, detection.Box, out var fittedRect) ? fittedRect : detection.Box;
+        var isPartial = detection.Label == "partial-seal";
+        return TryFitRedSealDisplayRect(image, detection.Box, isPartial, out var fittedRect) ? fittedRect : detection.Box;
     }
 
-    private static Boolean TryFitFullRedSealDisplayRect(Mat image, Rect detectionBox, out Rect fittedRect)
+    private static Boolean TryFitRedSealDisplayRect(Mat image, Rect detectionBox, Boolean isPartial, out Rect fittedRect)
     {
-        var padded = InflateRect(detectionBox, image.Width, image.Height, 18);
+        var padded = isPartial
+            ? new Rect(0, 0, image.Width, image.Height)
+            : InflateRect(detectionBox, image.Width, image.Height, 18);
         using var roi = new Mat(image, padded);
-        using var hsv = new Mat();
-        using var mask1 = new Mat();
-        using var mask2 = new Mat();
-        using var redMask = new Mat();
-
-        Cv2.CvtColor(roi, hsv, ColorConversionCodes.BGR2HSV);
-        Cv2.InRange(hsv, new Scalar(0, 80, 60), new Scalar(15, 255, 255), mask1);
-        Cv2.InRange(hsv, new Scalar(160, 80, 60), new Scalar(180, 255, 255), mask2);
-        Cv2.BitwiseOr(mask1, mask2, redMask);
+        using var redMask = BuildRedDisplayMask(roi);
 
         Cv2.FindContours(redMask, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
         if (contours.Length == 0)
@@ -311,7 +303,7 @@ internal sealed class StampDetectionPipeline
             new Rect(detectionBox.X - padded.X, detectionBox.Y - padded.Y, detectionBox.Width, detectionBox.Height),
             padded.Width,
             padded.Height,
-            12);
+            isPartial ? 0 : 12);
         var focusCenter = new Point2f(focusWindow.X + focusWindow.Width / 2f, focusWindow.Y + focusWindow.Height / 2f);
 
         var selectedContours = contours
@@ -322,18 +314,15 @@ internal sealed class StampDetectionPipeline
                 Area = Cv2.ContourArea(contour),
                 Perimeter = Cv2.ArcLength(contour, true)
             })
-            .Where(item => item.Area >= 50 && item.Perimeter > 0)
-            .Select(item => new
-            {
+            .Where(item => item.Area >= 50)
+            .Select(item => new RedDisplayContourCandidate(
                 item.Contour,
                 item.Rect,
                 item.Area,
-                Circularity = (Single)(4 * Math.PI * item.Area / (item.Perimeter * item.Perimeter))
-            })
-            .Where(item => MatchesFullRedDisplayContour(item.Rect, focusCenter, focusWindow, detectionBox))
-            .Where(item => item.Circularity >= 0.03f)
-            .OrderByDescending(item => ScoreFullRedDisplayContour(item.Rect, item.Area, item.Circularity, focusCenter, focusWindow))
-            .Take(3)
+                item.Perimeter <= 0 ? 0f : (Single)(4 * Math.PI * item.Area / (item.Perimeter * item.Perimeter))))
+            .Where(item => MatchesRedDisplayContour(item, focusCenter, focusWindow, detectionBox, padded, image.Width, image.Height, isPartial))
+            .OrderByDescending(item => ScoreRedDisplayContour(item, focusCenter, focusWindow, detectionBox, image.Width, image.Height, isPartial))
+            .Take(isPartial ? 2 : 3)
             .ToArray();
 
         if (selectedContours.Length == 0)
@@ -342,20 +331,23 @@ internal sealed class StampDetectionPipeline
             return false;
         }
 
-        var contourUnion = selectedContours
-            .Select(item => item.Rect)
-            .Aggregate((current, next) => UnionRects(current, next));
-        var tightRect = InflateRect(
-            new Rect(contourUnion.X + padded.X, contourUnion.Y + padded.Y, contourUnion.Width, contourUnion.Height),
-            image.Width,
-            image.Height,
-            4);
-
-        var tightAspectRatio = tightRect.Width / (Single)Math.Max(1, tightRect.Height);
-        if (tightAspectRatio is > 0.75f and < 1.25f)
+        if (!isPartial)
         {
-            fittedRect = tightRect;
-            return true;
+            var contourUnion = selectedContours
+                .Select(item => item.Rect)
+                .Aggregate((current, next) => UnionRects(current, next));
+            var tightRect = InflateRect(
+                new Rect(contourUnion.X + padded.X, contourUnion.Y + padded.Y, contourUnion.Width, contourUnion.Height),
+                image.Width,
+                image.Height,
+                4);
+
+            var tightAspectRatio = tightRect.Width / (Single)Math.Max(1, tightRect.Height);
+            if (tightAspectRatio is > 0.75f and < 1.25f)
+            {
+                fittedRect = tightRect;
+                return true;
+            }
         }
 
         var allPoints = selectedContours.SelectMany(item => item.Contour).ToArray();
@@ -380,65 +372,25 @@ internal sealed class StampDetectionPipeline
         return fittedRect.Width > 0 && fittedRect.Height > 0;
     }
 
-    private static Boolean TryFitSealDisplayRect(Mat image, Rect detectionBox, out Rect fittedRect)
+    private static Mat BuildRedDisplayMask(Mat source)
     {
         using var hsv = new Mat();
         using var mask1 = new Mat();
         using var mask2 = new Mat();
-        using var redMask = new Mat();
+        var redMask = new Mat();
 
-        Cv2.CvtColor(image, hsv, ColorConversionCodes.BGR2HSV);
+        Cv2.CvtColor(source, hsv, ColorConversionCodes.BGR2HSV);
         Cv2.InRange(hsv, new Scalar(0, 80, 60), new Scalar(15, 255, 255), mask1);
         Cv2.InRange(hsv, new Scalar(160, 80, 60), new Scalar(180, 255, 255), mask2);
         Cv2.BitwiseOr(mask1, mask2, redMask);
+        return redMask;
+    }
 
-        Cv2.FindContours(redMask, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
-        if (contours.Length == 0)
-        {
-            fittedRect = detectionBox;
-            return false;
-        }
-
-        var anchorCenter = new Point2f(detectionBox.X + detectionBox.Width / 2f, detectionBox.Y + detectionBox.Height / 2f);
-        var selectedContours = contours
-            .Select(contour => new
-            {
-                Contour = contour,
-                Rect = Cv2.BoundingRect(contour),
-                Area = Cv2.ContourArea(contour)
-            })
-            .Where(item => item.Area >= 50)
-            .Where(item => MatchesPartialDisplayContour(item.Rect, detectionBox, image.Width, image.Height))
-            .OrderByDescending(item => ScorePartialDisplayContour(item.Rect, item.Area, detectionBox, anchorCenter))
-            .Take(2)
-            .ToArray();
-
-        if (selectedContours.Length == 0)
-        {
-            fittedRect = detectionBox;
-            return false;
-        }
-
-        var allPoints = selectedContours.SelectMany(item => item.Contour).ToArray();
-        if (allPoints.Length < 5)
-        {
-            fittedRect = detectionBox;
-            return false;
-        }
-
-        Cv2.MinEnclosingCircle(allPoints, out var center, out var radius);
-        if (radius <= 1f)
-        {
-            fittedRect = detectionBox;
-            return false;
-        }
-
-        var left = Math.Clamp((Int32)MathF.Floor(center.X - radius), 0, Math.Max(0, image.Width - 1));
-        var top = Math.Clamp((Int32)MathF.Floor(center.Y - radius), 0, Math.Max(0, image.Height - 1));
-        var right = Math.Clamp((Int32)MathF.Ceiling(center.X + radius), left + 1, image.Width);
-        var bottom = Math.Clamp((Int32)MathF.Ceiling(center.Y + radius), top + 1, image.Height);
-        fittedRect = new Rect(left, top, right - left, bottom - top);
-        return fittedRect.Width > 0 && fittedRect.Height > 0;
+    private static Boolean MatchesRedDisplayContour(RedDisplayContourCandidate candidate, Point2f focusCenter, Rect focusWindow, Rect detectionBox, Rect padded, Int32 imageWidth, Int32 imageHeight, Boolean isPartial)
+    {
+        return isPartial
+            ? MatchesPartialDisplayContour(candidate.Rect, detectionBox, imageWidth, imageHeight)
+            : MatchesFullRedDisplayContour(candidate.Rect, focusCenter, focusWindow, detectionBox);
     }
 
     private static Boolean MatchesPartialDisplayContour(Rect contourRect, Rect detectionBox, Int32 imageWidth, Int32 imageHeight)
@@ -490,6 +442,13 @@ internal sealed class StampDetectionPipeline
         var maxWidth = Math.Max(contourRect.Width, detectionBox.Width);
         var maxHeight = Math.Max(contourRect.Height, detectionBox.Height);
         return union.Width <= maxWidth * 3.2f && union.Height <= maxHeight * 3.2f;
+    }
+
+    private static Single ScoreRedDisplayContour(RedDisplayContourCandidate candidate, Point2f focusCenter, Rect focusWindow, Rect detectionBox, Int32 imageWidth, Int32 imageHeight, Boolean isPartial)
+    {
+        return isPartial
+            ? ScorePartialDisplayContour(candidate.Rect, candidate.Area, detectionBox, focusCenter)
+            : ScoreFullRedDisplayContour(candidate.Rect, candidate.Area, candidate.Circularity, focusCenter, focusWindow);
     }
 
     private static Single ScorePartialDisplayContour(Rect contourRect, Double area, Rect detectionBox, Point2f anchorCenter)
@@ -547,6 +506,8 @@ internal sealed class StampDetectionPipeline
 
         return true;
     }
+
+    private sealed record RedDisplayContourCandidate(Point[] Contour, Rect Rect, Double Area, Single Circularity);
 
     private static Boolean ContainsPoint(Rect rect, Point2f point)
     {
