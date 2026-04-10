@@ -451,8 +451,18 @@ internal sealed class OpenCvSealCandidateDetector
 
         foreach (var neutral in neutralDetections)
         {
-            if (redDetections.Any(red => IsNearRelatedDetection(red.Box, neutral.Box)))
-                kept.Add(neutral);
+            var relatedRedDetections = redDetections.Where(red => IsNearRelatedDetection(red.Box, neutral.Box)).ToList();
+            if (relatedRedDetections.Count == 0)
+                continue;
+
+            if (relatedRedDetections.Count > 1)
+                continue;
+
+            var relatedRed = relatedRedDetections[0];
+            if (neutral.Box.Width > relatedRed.Box.Width * 1.45f || neutral.Box.Height > relatedRed.Box.Height * 1.45f)
+                continue;
+
+            kept.Add(neutral);
         }
 
         return kept;
@@ -488,7 +498,7 @@ internal sealed class OpenCvSealCandidateDetector
             {
                 for (var secondIndex = firstIndex + 1; secondIndex < pending.Count; secondIndex++)
                 {
-                    if (!ShouldMerge(pending[firstIndex], pending[secondIndex]))
+                    if (!ShouldMerge(pending[firstIndex], pending[secondIndex], imageWidth, imageHeight))
                         continue;
 
                     pending[firstIndex] = MergeDetection(pending[firstIndex], pending[secondIndex], imageWidth, imageHeight);
@@ -502,8 +512,11 @@ internal sealed class OpenCvSealCandidateDetector
         return pending;
     }
 
-    private static Boolean ShouldMerge(SealDetection first, SealDetection second)
+    private static Boolean ShouldMerge(SealDetection first, SealDetection second, Int32 imageWidth, Int32 imageHeight)
     {
+        if (ShouldKeepSeparateEdgePartials(first, second, imageWidth, imageHeight))
+            return false;
+
         var union = Union(first.Box, second.Box);
         var maxWidth = Math.Max(first.Box.Width, second.Box.Width);
         var maxHeight = Math.Max(first.Box.Height, second.Box.Height);
@@ -515,6 +528,32 @@ internal sealed class OpenCvSealCandidateDetector
         var sameNeighborhood = centerDeltaX <= union.Width * 0.75f && centerDeltaY <= union.Height * 0.75f;
         var reasonableUnion = union.Width <= maxWidth * 1.8f && union.Height <= maxHeight * 1.8f;
         return closeEnough && sameNeighborhood && reasonableUnion;
+    }
+
+    private static Boolean ShouldKeepSeparateEdgePartials(SealDetection first, SealDetection second, Int32 imageWidth, Int32 imageHeight)
+    {
+        if (first.Label != "partial-seal" || second.Label != "partial-seal")
+            return false;
+
+        var touchesTop = first.Box.Top <= 6 && second.Box.Top <= 6;
+        var touchesBottom = first.Box.Bottom >= imageHeight - 6 && second.Box.Bottom >= imageHeight - 6;
+        var touchesLeft = first.Box.Left <= 6 && second.Box.Left <= 6;
+        var touchesRight = first.Box.Right >= imageWidth - 6 && second.Box.Right >= imageWidth - 6;
+        if (!touchesTop && !touchesBottom && !touchesLeft && !touchesRight)
+            return false;
+
+        var gapX = Math.Max(0, Math.Max(first.Box.Left, second.Box.Left) - Math.Min(first.Box.Right, second.Box.Right));
+        var gapY = Math.Max(0, Math.Max(first.Box.Top, second.Box.Top) - Math.Min(first.Box.Bottom, second.Box.Bottom));
+        var maxWidth = Math.Max(first.Box.Width, second.Box.Width);
+        var maxHeight = Math.Max(first.Box.Height, second.Box.Height);
+
+        if ((touchesTop || touchesBottom) && gapX > maxWidth * 0.35f)
+            return true;
+
+        if ((touchesLeft || touchesRight) && gapY > maxHeight * 0.35f)
+            return true;
+
+        return false;
     }
 
     private static SealDetection MergeDetection(SealDetection first, SealDetection second, Int32 imageWidth, Int32 imageHeight)
