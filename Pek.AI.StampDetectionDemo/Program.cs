@@ -267,11 +267,101 @@ internal sealed class StampDetectionPipeline
     {
         foreach (var detection in detections)
         {
-            Cv2.Rectangle(image, detection.Box, color, 2);
+            var displayRect = GetDisplayRectForDrawing(image, detection);
+            Cv2.Rectangle(image, displayRect, color, 2);
             var caption = $"{prefix}:{detection.Score:0.00}";
-            var textPoint = new Point(detection.Box.X, Math.Max(18, detection.Box.Y - 6));
+            var textPoint = new Point(displayRect.X, Math.Max(18, displayRect.Y - 6));
             Cv2.PutText(image, caption, textPoint, HersheyFonts.HersheySimplex, 0.6, color, 2);
         }
+    }
+
+    private static Rect GetDisplayRectForDrawing(Mat image, SealDetection detection)
+    {
+        if (detection.Label != "partial-seal" || !detection.Source.Contains("opencv", StringComparison.OrdinalIgnoreCase))
+            return detection.Box;
+
+        return TryFitSealDisplayRect(image, detection.Box, out var fittedRect) ? fittedRect : detection.Box;
+    }
+
+    private static Boolean TryFitSealDisplayRect(Mat image, Rect detectionBox, out Rect fittedRect)
+    {
+        var padded = InflateRect(detectionBox, image.Width, image.Height, 24);
+        using var roi = new Mat(image, padded);
+        using var hsv = new Mat();
+        using var mask1 = new Mat();
+        using var mask2 = new Mat();
+        using var redMask = new Mat();
+
+        Cv2.CvtColor(roi, hsv, ColorConversionCodes.BGR2HSV);
+        Cv2.InRange(hsv, new Scalar(0, 80, 60), new Scalar(15, 255, 255), mask1);
+        Cv2.InRange(hsv, new Scalar(160, 80, 60), new Scalar(180, 255, 255), mask2);
+        Cv2.BitwiseOr(mask1, mask2, redMask);
+
+        Cv2.FindContours(redMask, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+        if (contours.Length == 0)
+        {
+            fittedRect = detectionBox;
+            return false;
+        }
+
+        var anchorCenter = new Point2f(detectionBox.X + detectionBox.Width / 2f - padded.X, detectionBox.Y + detectionBox.Height / 2f - padded.Y);
+        var selectedContours = contours
+            .Select(contour => new
+            {
+                Contour = contour,
+                Rect = Cv2.BoundingRect(contour),
+                Area = Cv2.ContourArea(contour)
+            })
+            .Where(item => item.Area >= 50)
+            .OrderBy(item => DistanceToRectCenter(item.Rect, anchorCenter))
+            .ThenByDescending(item => item.Area)
+            .Take(2)
+            .ToArray();
+
+        if (selectedContours.Length == 0)
+        {
+            fittedRect = detectionBox;
+            return false;
+        }
+
+        var allPoints = selectedContours.SelectMany(item => item.Contour).ToArray();
+        if (allPoints.Length < 5)
+        {
+            fittedRect = detectionBox;
+            return false;
+        }
+
+        Cv2.MinEnclosingCircle(allPoints, out var center, out var radius);
+        if (radius <= 1f)
+        {
+            fittedRect = detectionBox;
+            return false;
+        }
+
+        var left = Math.Clamp((Int32)MathF.Floor(center.X - radius) + padded.X, 0, Math.Max(0, image.Width - 1));
+        var top = Math.Clamp((Int32)MathF.Floor(center.Y - radius) + padded.Y, 0, Math.Max(0, image.Height - 1));
+        var right = Math.Clamp((Int32)MathF.Ceiling(center.X + radius) + padded.X, left + 1, image.Width);
+        var bottom = Math.Clamp((Int32)MathF.Ceiling(center.Y + radius) + padded.Y, top + 1, image.Height);
+        fittedRect = new Rect(left, top, right - left, bottom - top);
+        return fittedRect.Width > 0 && fittedRect.Height > 0;
+    }
+
+    private static Rect InflateRect(Rect rect, Int32 imageWidth, Int32 imageHeight, Int32 padding)
+    {
+        var left = Math.Max(0, rect.Left - padding);
+        var top = Math.Max(0, rect.Top - padding);
+        var right = Math.Min(imageWidth, rect.Right + padding);
+        var bottom = Math.Min(imageHeight, rect.Bottom + padding);
+        return new Rect(left, top, Math.Max(1, right - left), Math.Max(1, bottom - top));
+    }
+
+    private static Single DistanceToRectCenter(Rect rect, Point2f point)
+    {
+        var centerX = rect.X + rect.Width / 2f;
+        var centerY = rect.Y + rect.Height / 2f;
+        var deltaX = centerX - point.X;
+        var deltaY = centerY - point.Y;
+        return MathF.Sqrt(deltaX * deltaX + deltaY * deltaY);
     }
 }
 
