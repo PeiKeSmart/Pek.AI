@@ -4,6 +4,20 @@ using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Windows.Forms;
+using Cv2 = OpenCvSharp.Cv2;
+using CvAdaptiveThresholdTypes = OpenCvSharp.AdaptiveThresholdTypes;
+using CvColorConversionCodes = OpenCvSharp.ColorConversionCodes;
+using CvContourApproximationModes = OpenCvSharp.ContourApproximationModes;
+using CvImreadModes = OpenCvSharp.ImreadModes;
+using CvMat = OpenCvSharp.Mat;
+using CvMatType = OpenCvSharp.MatType;
+using CvMorphShapes = OpenCvSharp.MorphShapes;
+using CvMorphTypes = OpenCvSharp.MorphTypes;
+using CvRect = OpenCvSharp.Rect;
+using CvRetrievalModes = OpenCvSharp.RetrievalModes;
+using CvScalar = OpenCvSharp.Scalar;
+using CvSize = OpenCvSharp.Size;
+using CvThresholdTypes = OpenCvSharp.ThresholdTypes;
 
 namespace Pek.AI.StampAnnotationTool;
 
@@ -16,6 +30,7 @@ internal sealed class MainForm : Form
     private readonly ComboBox _classComboBox;
     private readonly TextBox _labelsTextBox;
     private readonly Label _statusLabel;
+    private readonly StampPreAnnotationDetector _preAnnotationDetector = new();
     private readonly Dictionary<String, AnnotationDocument> _documents = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<String> _imageFiles = [];
 
@@ -103,6 +118,9 @@ internal sealed class MainForm : Form
             Margin = new Padding(0, 8, 0, 0)
         };
         exportPanel.Controls.Add(CreateActionButton("导出 YOLO 数据集", (_, _) => ExportDataset()));
+        exportPanel.Controls.Add(CreateActionButton("自动预标注当前", (_, _) => AutoAnnotateCurrent()));
+        exportPanel.Controls.Add(CreateActionButton("自动预标注未标注", (_, _) => AutoAnnotateUnlabeled()));
+        exportPanel.Controls.Add(CreateActionButton("重置视图", (_, _) => ResetCanvasView()));
         exportPanel.Controls.Add(CreateActionButton("重新加载标签", (_, _) => ReloadLabelsFromFolder()));
         leftLayout.Controls.Add(exportPanel, 0, 4);
 
@@ -378,6 +396,7 @@ internal sealed class MainForm : Form
         _canvas.CurrentAnnotations = document.Annotations;
         _canvas.Labels = _labels;
         _canvas.ActiveClassId = Math.Max(0, _classComboBox.SelectedIndex);
+        _canvas.ResetView();
         _canvas.Invalidate();
         _statusLabel.Text = $"当前图片：{Path.GetFileName(imagePath)}，标注数：{document.Annotations.Count}";
     }
@@ -533,6 +552,79 @@ internal sealed class MainForm : Form
         MessageBox.Show(this, $"已导出 {labeledImages.Length} 张已标注图片。", "导出完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
+    private void AutoAnnotateCurrent()
+    {
+        if (String.IsNullOrWhiteSpace(_currentImagePath))
+            return;
+
+        var document = _documents[_currentImagePath];
+        if (document.Annotations.Count > 0)
+        {
+            var answer = MessageBox.Show(this, "当前图片已经有标注，是否用自动预标注结果覆盖？", "自动预标注", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (answer != DialogResult.Yes)
+                return;
+        }
+
+        ApplyAutoAnnotations(_currentImagePath, document, overwrite: true);
+        RefreshImageListDisplay();
+        _canvas.Invalidate();
+    }
+
+    private void AutoAnnotateUnlabeled()
+    {
+        if (_imageFiles.Count == 0)
+            return;
+
+        var processed = 0;
+        foreach (var imagePath in _imageFiles)
+        {
+            var document = _documents[imagePath];
+            if (document.Annotations.Count > 0)
+                continue;
+
+            processed += ApplyAutoAnnotations(imagePath, document, overwrite: false);
+        }
+
+        RefreshImageListDisplay();
+        _canvas.Invalidate();
+        _statusLabel.Text = $"自动预标注完成，共生成 {processed} 个候选框。";
+    }
+
+    private Int32 ApplyAutoAnnotations(String imagePath, AnnotationDocument document, Boolean overwrite)
+    {
+        var detections = _preAnnotationDetector.Detect(imagePath);
+        if (overwrite)
+            document.Annotations.Clear();
+
+        foreach (var detection in detections)
+        {
+            document.Annotations.Add(new AnnotationBox
+            {
+                ClassId = ResolveClassId(detection.Label),
+                NormalizedBox = detection.NormalizedBox
+            });
+        }
+
+        if (String.Equals(imagePath, _currentImagePath, StringComparison.OrdinalIgnoreCase))
+        {
+            _canvas.CurrentAnnotations = document.Annotations;
+            _statusLabel.Text = $"自动预标注完成：{Path.GetFileName(imagePath)}，候选数：{detections.Count}";
+        }
+
+        return detections.Count;
+    }
+
+    private Int32 ResolveClassId(String label)
+    {
+        var index = _labels.FindIndex(item => String.Equals(item, label, StringComparison.OrdinalIgnoreCase));
+        return index >= 0 ? index : 0;
+    }
+
+    private void ResetCanvasView()
+    {
+        _canvas.ResetView();
+    }
+
     private String BuildDatasetYaml(String outputFolder)
     {
         var builder = new StringBuilder();
@@ -625,10 +717,14 @@ internal sealed class AnnotationCanvas : Control
     private RectangleF _imageBounds;
     private Boolean _isDrawing;
     private Boolean _isDraggingSelection;
+    private Boolean _isPanning;
     private Point _dragStart;
     private Point _dragEnd;
     private Point _lastDragPoint;
+    private Point _lastPanPoint;
     private Int32 _selectedIndex = -1;
+    private Single _zoom = 1f;
+    private PointF _panOffset = PointF.Empty;
 
     public AnnotationCanvas()
     {
@@ -691,6 +787,13 @@ internal sealed class AnnotationCanvas : Control
         Invalidate();
     }
 
+    public void ResetView()
+    {
+        _zoom = 1f;
+        _panOffset = PointF.Empty;
+        Invalidate();
+    }
+
     public Boolean ApplyClassToSelection(Int32 classId)
     {
         if (!HasValidSelection())
@@ -742,7 +845,7 @@ internal sealed class AnnotationCanvas : Control
             return;
         }
 
-        _imageBounds = CalculateImageBounds(_currentBitmap.Size, ClientRectangle);
+        _imageBounds = CalculateImageBounds(_currentBitmap.Size, ClientRectangle, _zoom, _panOffset);
         e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
         e.Graphics.DrawImage(_currentBitmap, _imageBounds);
 
@@ -767,6 +870,15 @@ internal sealed class AnnotationCanvas : Control
         base.OnMouseDown(e);
         if (_currentBitmap == null || _annotations == null)
             return;
+
+        if (e.Button == MouseButtons.Middle)
+        {
+            _isPanning = true;
+            _lastPanPoint = e.Location;
+            Capture = true;
+            Cursor = Cursors.Hand;
+            return;
+        }
 
         if (e.Button == MouseButtons.Left)
         {
@@ -804,6 +916,14 @@ internal sealed class AnnotationCanvas : Control
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
+        if (_isPanning)
+        {
+            _panOffset = new PointF(_panOffset.X + (e.X - _lastPanPoint.X), _panOffset.Y + (e.Y - _lastPanPoint.Y));
+            _lastPanPoint = e.Location;
+            Invalidate();
+            return;
+        }
+
         if (_isDraggingSelection)
         {
             DragSelectedAnnotation(e.Location);
@@ -820,6 +940,14 @@ internal sealed class AnnotationCanvas : Control
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
+        if (_isPanning)
+        {
+            _isPanning = false;
+            Capture = false;
+            Cursor = Cursors.Default;
+            return;
+        }
+
         if (_isDraggingSelection)
         {
             _isDraggingSelection = false;
@@ -856,6 +984,30 @@ internal sealed class AnnotationCanvas : Control
         _selectedIndex = _annotations.Count - 1;
         AnnotationCreated?.Invoke(this, EventArgs.Empty);
         Invalidate();
+    }
+
+    protected override void OnMouseWheel(MouseEventArgs e)
+    {
+        base.OnMouseWheel(e);
+        if (_currentBitmap == null)
+            return;
+
+        var previousZoom = _zoom;
+        _zoom = e.Delta > 0 ? MathF.Min(8f, _zoom * 1.15f) : MathF.Max(0.2f, _zoom / 1.15f);
+        if (Math.Abs(previousZoom - _zoom) < Single.Epsilon)
+            return;
+
+        var scaleFactor = _zoom / previousZoom;
+        _panOffset = new PointF(
+            (e.X - Width / 2f) - ((e.X - Width / 2f - _panOffset.X) * scaleFactor),
+            (e.Y - Height / 2f) - ((e.Y - Height / 2f - _panOffset.Y) * scaleFactor));
+        Invalidate();
+    }
+
+    protected override void OnDoubleClick(EventArgs e)
+    {
+        base.OnDoubleClick(e);
+        ResetView();
     }
 
     private void DragSelectedAnnotation(Point point)
@@ -958,16 +1110,16 @@ internal sealed class AnnotationCanvas : Control
         return RectangleF.FromLTRB(left, top, right, bottom);
     }
 
-    private static RectangleF CalculateImageBounds(Size imageSize, Rectangle clientRectangle)
+    private static RectangleF CalculateImageBounds(Size imageSize, Rectangle clientRectangle, Single zoom, PointF panOffset)
     {
         const Int32 padding = 12;
         var availableWidth = Math.Max(1, clientRectangle.Width - padding * 2);
         var availableHeight = Math.Max(1, clientRectangle.Height - padding * 2);
         var scale = Math.Min(availableWidth / (Single)imageSize.Width, availableHeight / (Single)imageSize.Height);
-        var width = imageSize.Width * scale;
-        var height = imageSize.Height * scale;
-        var x = clientRectangle.Left + (clientRectangle.Width - width) / 2f;
-        var y = clientRectangle.Top + (clientRectangle.Height - height) / 2f;
+        var width = imageSize.Width * scale * zoom;
+        var height = imageSize.Height * scale * zoom;
+        var x = clientRectangle.Left + (clientRectangle.Width - width) / 2f + panOffset.X;
+        var y = clientRectangle.Top + (clientRectangle.Height - height) / 2f + panOffset.Y;
         return new RectangleF(x, y, width, height);
     }
 
@@ -1000,3 +1152,260 @@ internal sealed class AnnotationManifestItem
 
     public required Int32 Count { get; init; }
 }
+
+internal sealed class StampPreAnnotationDetector
+{
+    public IReadOnlyList<DetectedAnnotation> Detect(String imagePath)
+    {
+        using var source = Cv2.ImRead(imagePath, CvImreadModes.Color);
+        if (source.Empty())
+            return [];
+
+        var redDetections = DetectFromMask(source, BuildRedSealMask(source), "seal", allowPartial: true);
+        var neutralDetections = DetectFromMask(source, BuildNeutralSealMask(source), "seal", allowPartial: true);
+
+        if (redDetections.Count > 0)
+            neutralDetections = FilterNeutralDetectionsNearRed(redDetections, neutralDetections);
+
+        var allDetections = new List<DetectedAnnotation>(redDetections.Count + neutralDetections.Count);
+        allDetections.AddRange(redDetections);
+        allDetections.AddRange(neutralDetections);
+        var filtered = ApplyNms(allDetections, 0.3f);
+        return MergeNearby(filtered, source.Width, source.Height);
+    }
+
+    private static List<DetectedAnnotation> DetectFromMask(CvMat source, CvMat mask, String label, Boolean allowPartial)
+    {
+        using var ownedMask = mask;
+        Cv2.FindContours(ownedMask, out var contours, out _, CvRetrievalModes.External, CvContourApproximationModes.ApproxSimple);
+        var detections = new List<DetectedAnnotation>();
+        var imageArea = source.Width * source.Height;
+
+        foreach (var contour in contours)
+        {
+            var area = Cv2.ContourArea(contour);
+            if (area < 120 || area > imageArea * 0.35)
+                continue;
+
+            var perimeter = Cv2.ArcLength(contour, true);
+            if (perimeter <= 0)
+                continue;
+
+            var circularity = 4 * Math.PI * area / (perimeter * perimeter);
+            var rect = Cv2.BoundingRect(contour);
+            var aspectRatio = rect.Width / (Single)Math.Max(1, rect.Height);
+            if (aspectRatio is < 0.22f or > 4.5f)
+                continue;
+
+            var rectArea = rect.Width * rect.Height;
+            if (rectArea <= 0)
+                continue;
+
+            var fillRatio = (Single)(area / rectArea);
+            var touchesEdge = rect.Left <= 6 || rect.Top <= 6 || rect.Right >= source.Width - 6 || rect.Bottom >= source.Height - 6;
+            var partialCandidate = allowPartial && (touchesEdge || circularity < 0.22 || fillRatio < 0.2f);
+
+            if (!partialCandidate && circularity < 0.12 && (aspectRatio < 0.7f || aspectRatio > 1.4f))
+                continue;
+
+            if (partialCandidate && fillRatio < 0.06f)
+                continue;
+
+            using var roi = new CvMat(source, rect);
+            var edgeDensity = ComputeEdgeDensity(roi);
+            var strokeDensity = ComputeStrokeDensity(ownedMask, rect);
+            if (edgeDensity < 0.015f && strokeDensity < 0.04f)
+                continue;
+
+            var score = 0.2f;
+            score += MathF.Min(0.3f, MathF.Max(0f, (Single)circularity * 0.35f));
+            score += MathF.Min(0.2f, fillRatio * 0.3f);
+            score += MathF.Min(0.2f, edgeDensity * 1.4f);
+            score += MathF.Min(0.2f, strokeDensity * 0.8f);
+            if (partialCandidate)
+                score = MathF.Max(score, 0.38f);
+
+            detections.Add(new DetectedAnnotation(Normalize(rect, source.Width, source.Height), MathF.Min(0.95f, score), partialCandidate ? "partial-seal" : label));
+        }
+
+        return detections;
+    }
+
+    private static CvMat BuildRedSealMask(CvMat source)
+    {
+        using var hsv = new CvMat();
+        using var mask1 = new CvMat();
+        using var mask2 = new CvMat();
+        var mask = new CvMat();
+        using var morph = new CvMat();
+        Cv2.CvtColor(source, hsv, CvColorConversionCodes.BGR2HSV);
+        Cv2.InRange(hsv, new CvScalar(0, 80, 60), new CvScalar(15, 255, 255), mask1);
+        Cv2.InRange(hsv, new CvScalar(160, 80, 60), new CvScalar(180, 255, 255), mask2);
+        Cv2.BitwiseOr(mask1, mask2, mask);
+        using var kernel = Cv2.GetStructuringElement(CvMorphShapes.Ellipse, new CvSize(5, 5));
+        Cv2.MorphologyEx(mask, morph, CvMorphTypes.Close, kernel, iterations: 2);
+        Cv2.MorphologyEx(morph, morph, CvMorphTypes.Open, kernel, iterations: 1);
+        morph.CopyTo(mask);
+        return mask;
+    }
+
+    private static CvMat BuildNeutralSealMask(CvMat source)
+    {
+        using var gray = new CvMat();
+        using var blur = new CvMat();
+        using var adaptive = new CvMat();
+        using var edges = new CvMat();
+        using var gradient = new CvMat();
+        using var texture = new CvMat();
+        using var merged = new CvMat();
+        var mask = new CvMat();
+        Cv2.CvtColor(source, gray, CvColorConversionCodes.BGR2GRAY);
+        Cv2.GaussianBlur(gray, blur, new CvSize(5, 5), 0);
+        Cv2.AdaptiveThreshold(blur, adaptive, 255, CvAdaptiveThresholdTypes.GaussianC, CvThresholdTypes.BinaryInv, 31, 8);
+        Cv2.Canny(blur, edges, 60, 180);
+        Cv2.Laplacian(blur, gradient, CvMatType.CV_8U, 3);
+        Cv2.Threshold(gradient, texture, 24, 255, CvThresholdTypes.Binary);
+        Cv2.BitwiseOr(adaptive, edges, merged);
+        Cv2.BitwiseOr(merged, texture, mask);
+        using var kernel = Cv2.GetStructuringElement(CvMorphShapes.Ellipse, new CvSize(5, 5));
+        Cv2.MorphologyEx(mask, mask, CvMorphTypes.Close, kernel, iterations: 2);
+        Cv2.MorphologyEx(mask, mask, CvMorphTypes.Open, kernel, iterations: 1);
+        Cv2.Dilate(mask, mask, kernel, iterations: 1);
+        return mask;
+    }
+
+    private static Single ComputeEdgeDensity(CvMat roi)
+    {
+        using var gray = new CvMat();
+        using var edges = new CvMat();
+        Cv2.CvtColor(roi, gray, CvColorConversionCodes.BGR2GRAY);
+        Cv2.Canny(gray, edges, 50, 150);
+        return Cv2.CountNonZero(edges) / (Single)Math.Max(1, roi.Width * roi.Height);
+    }
+
+    private static Single ComputeStrokeDensity(CvMat mask, CvRect rect)
+    {
+        using var roi = new CvMat(mask, rect);
+        return Cv2.CountNonZero(roi) / (Single)Math.Max(1, rect.Width * rect.Height);
+    }
+
+    private static List<DetectedAnnotation> FilterNeutralDetectionsNearRed(IReadOnlyList<DetectedAnnotation> redDetections, IReadOnlyList<DetectedAnnotation> neutralDetections)
+    {
+        var kept = new List<DetectedAnnotation>();
+        foreach (var neutral in neutralDetections)
+        {
+            if (redDetections.Any(red => AreNear(red.NormalizedBox, neutral.NormalizedBox)))
+                kept.Add(neutral);
+        }
+
+        return kept;
+    }
+
+    private static Boolean AreNear(RectangleF first, RectangleF second)
+    {
+        var union = RectangleF.FromLTRB(Math.Min(first.Left, second.Left), Math.Min(first.Top, second.Top), Math.Max(first.Right, second.Right), Math.Max(first.Bottom, second.Bottom));
+        var maxWidth = Math.Max(first.Width, second.Width);
+        var maxHeight = Math.Max(first.Height, second.Height);
+        var overlap = ComputeIou(first, second);
+        if (overlap > 0)
+            return true;
+
+        var centerDeltaX = Math.Abs((first.Left + first.Right) - (second.Left + second.Right)) / 2f;
+        var centerDeltaY = Math.Abs((first.Top + first.Bottom) - (second.Top + second.Bottom)) / 2f;
+        return centerDeltaX <= maxWidth * 0.9f && centerDeltaY <= maxHeight * 0.9f && union.Width <= maxWidth * 1.9f && union.Height <= maxHeight * 1.9f;
+    }
+
+    private static IReadOnlyList<DetectedAnnotation> ApplyNms(IReadOnlyList<DetectedAnnotation> detections, Single iouThreshold)
+    {
+        if (detections.Count <= 1)
+            return detections;
+
+        var ordered = detections.OrderByDescending(item => item.Score).ToList();
+        var kept = new List<DetectedAnnotation>();
+        while (ordered.Count > 0)
+        {
+            var current = ordered[0];
+            kept.Add(current);
+            ordered.RemoveAt(0);
+            ordered.RemoveAll(candidate => ComputeIou(current.NormalizedBox, candidate.NormalizedBox) >= iouThreshold);
+        }
+
+        return kept;
+    }
+
+    private static IReadOnlyList<DetectedAnnotation> MergeNearby(IReadOnlyList<DetectedAnnotation> detections, Int32 imageWidth, Int32 imageHeight)
+    {
+        if (detections.Count <= 1)
+            return detections;
+
+        var pending = detections.ToList();
+        var merged = true;
+        while (merged)
+        {
+            merged = false;
+            for (var firstIndex = 0; firstIndex < pending.Count && !merged; firstIndex++)
+            {
+                for (var secondIndex = firstIndex + 1; secondIndex < pending.Count; secondIndex++)
+                {
+                    if (!ShouldMerge(pending[firstIndex].NormalizedBox, pending[secondIndex].NormalizedBox))
+                        continue;
+
+                    var union = RectangleF.FromLTRB(
+                        Math.Min(pending[firstIndex].NormalizedBox.Left, pending[secondIndex].NormalizedBox.Left),
+                        Math.Min(pending[firstIndex].NormalizedBox.Top, pending[secondIndex].NormalizedBox.Top),
+                        Math.Max(pending[firstIndex].NormalizedBox.Right, pending[secondIndex].NormalizedBox.Right),
+                        Math.Max(pending[firstIndex].NormalizedBox.Bottom, pending[secondIndex].NormalizedBox.Bottom));
+                    var label = pending[firstIndex].Label == "partial-seal" || pending[secondIndex].Label == "partial-seal" ? "partial-seal" : "seal";
+                    pending[firstIndex] = new DetectedAnnotation(union, MathF.Max(pending[firstIndex].Score, pending[secondIndex].Score), label);
+                    pending.RemoveAt(secondIndex);
+                    merged = true;
+                    break;
+                }
+            }
+        }
+
+        return pending;
+    }
+
+    private static Boolean ShouldMerge(RectangleF first, RectangleF second)
+    {
+        var union = RectangleF.FromLTRB(Math.Min(first.Left, second.Left), Math.Min(first.Top, second.Top), Math.Max(first.Right, second.Right), Math.Max(first.Bottom, second.Bottom));
+        var maxWidth = Math.Max(first.Width, second.Width);
+        var maxHeight = Math.Max(first.Height, second.Height);
+        var gapX = Math.Max(0, Math.Max(first.Left, second.Left) - Math.Min(first.Right, second.Right));
+        var gapY = Math.Max(0, Math.Max(first.Top, second.Top) - Math.Min(first.Bottom, second.Bottom));
+        var centerDeltaX = Math.Abs((first.Left + first.Right) - (second.Left + second.Right)) / 2f;
+        var centerDeltaY = Math.Abs((first.Top + first.Bottom) - (second.Top + second.Bottom)) / 2f;
+        var closeEnough = gapX <= maxWidth * 0.6f && gapY <= maxHeight * 0.6f;
+        var sameNeighborhood = centerDeltaX <= union.Width * 0.75f && centerDeltaY <= union.Height * 0.75f;
+        var reasonableUnion = union.Width <= maxWidth * 1.8f && union.Height <= maxHeight * 1.8f;
+        return closeEnough && sameNeighborhood && reasonableUnion;
+    }
+
+    private static Single ComputeIou(RectangleF first, RectangleF second)
+    {
+        var x1 = Math.Max(first.Left, second.Left);
+        var y1 = Math.Max(first.Top, second.Top);
+        var x2 = Math.Min(first.Right, second.Right);
+        var y2 = Math.Min(first.Bottom, second.Bottom);
+        var intersectionWidth = Math.Max(0, x2 - x1);
+        var intersectionHeight = Math.Max(0, y2 - y1);
+        var intersection = intersectionWidth * intersectionHeight;
+        if (intersection <= 0)
+            return 0;
+
+        var union = first.Width * first.Height + second.Width * second.Height - intersection;
+        return union <= 0 ? 0 : intersection / union;
+    }
+
+    private static RectangleF Normalize(CvRect rect, Int32 width, Int32 height)
+    {
+        return new RectangleF(
+            rect.X / (Single)Math.Max(1, width),
+            rect.Y / (Single)Math.Max(1, height),
+            rect.Width / (Single)Math.Max(1, width),
+            rect.Height / (Single)Math.Max(1, height));
+    }
+}
+
+internal sealed record DetectedAnnotation(RectangleF NormalizedBox, Single Score, String Label);
