@@ -259,13 +259,18 @@ internal sealed class OpenCvSealCandidateDetector
 {
     public IReadOnlyList<SealDetection> Detect(Mat source)
     {
-        var detections = new List<SealDetection>();
-
         using var redMask = BuildRedSealMask(source);
-        detections.AddRange(DetectFromMask(source, redMask, channelName: "opencv-red", allowPartial: true));
+        var redDetections = DetectFromMask(source, redMask, channelName: "opencv-red", allowPartial: true);
 
         using var neutralMask = BuildNeutralSealMask(source);
-        detections.AddRange(DetectFromMask(source, neutralMask, channelName: "opencv-neutral", allowPartial: true));
+        var neutralDetections = DetectFromMask(source, neutralMask, channelName: "opencv-neutral", allowPartial: true);
+
+        if (redDetections.Count > 0)
+            neutralDetections = FilterNeutralDetectionsNearRed(redDetections, neutralDetections);
+
+        var detections = new List<SealDetection>(redDetections.Count + neutralDetections.Count);
+        detections.AddRange(redDetections);
+        detections.AddRange(neutralDetections);
 
         var filtered = NonMaxSuppression.Apply(detections, 0.3f);
         return MergeNearbyDetections(filtered, source.Width, source.Height);
@@ -396,6 +401,33 @@ internal sealed class OpenCvSealCandidateDetector
         return Cv2.CountNonZero(roi) / (Single)Math.Max(1, rect.Width * rect.Height);
     }
 
+    private static List<SealDetection> FilterNeutralDetectionsNearRed(IReadOnlyList<SealDetection> redDetections, IReadOnlyList<SealDetection> neutralDetections)
+    {
+        var kept = new List<SealDetection>();
+
+        foreach (var neutral in neutralDetections)
+        {
+            if (redDetections.Any(red => IsNearRelatedDetection(red.Box, neutral.Box)))
+                kept.Add(neutral);
+        }
+
+        return kept;
+    }
+
+    private static Boolean IsNearRelatedDetection(Rect anchor, Rect candidate)
+    {
+        var union = Union(anchor, candidate);
+        var maxWidth = Math.Max(anchor.Width, candidate.Width);
+        var maxHeight = Math.Max(anchor.Height, candidate.Height);
+        var overlap = ComputeRectIou(anchor, candidate);
+        if (overlap > 0)
+            return true;
+
+        var centerDeltaX = Math.Abs((anchor.Left + anchor.Right) - (candidate.Left + candidate.Right)) / 2f;
+        var centerDeltaY = Math.Abs((anchor.Top + anchor.Bottom) - (candidate.Top + candidate.Bottom)) / 2f;
+        return centerDeltaX <= maxWidth * 0.9f && centerDeltaY <= maxHeight * 0.9f && union.Width <= maxWidth * 1.9f && union.Height <= maxHeight * 1.9f;
+    }
+
     private static IReadOnlyList<SealDetection> MergeNearbyDetections(IReadOnlyList<SealDetection> detections, Int32 imageWidth, Int32 imageHeight)
     {
         if (detections.Count <= 1)
@@ -462,6 +494,22 @@ internal sealed class OpenCvSealCandidateDetector
         var right = Math.Max(first.Right, second.Right);
         var bottom = Math.Max(first.Bottom, second.Bottom);
         return new Rect(left, top, right - left, bottom - top);
+    }
+
+    private static Single ComputeRectIou(Rect first, Rect second)
+    {
+        var x1 = Math.Max(first.Left, second.Left);
+        var y1 = Math.Max(first.Top, second.Top);
+        var x2 = Math.Min(first.Right, second.Right);
+        var y2 = Math.Min(first.Bottom, second.Bottom);
+        var intersectionWidth = Math.Max(0, x2 - x1);
+        var intersectionHeight = Math.Max(0, y2 - y1);
+        var intersection = intersectionWidth * intersectionHeight;
+        if (intersection <= 0)
+            return 0;
+
+        var union = first.Width * first.Height + second.Width * second.Height - intersection;
+        return union <= 0 ? 0 : intersection / (Single)union;
     }
 }
 
