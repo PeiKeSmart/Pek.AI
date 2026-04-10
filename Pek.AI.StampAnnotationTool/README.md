@@ -6,10 +6,12 @@
 
 ## 支持的输出
 
-1. 每张图片对应一个 YOLO 标签文件：`xxx.txt`
+1. 每张图片对应一个 YOLO 标签文件，默认保存在图片目录下的 `labels/xxx.txt`
 2. `labels.txt`：每行一个类别名
 3. `dataset.yaml`：YOLO 训练数据描述文件
 4. `annotations.json`：标注清单
+
+说明：当前工具统一使用 `labels/xxx.txt` 布局，不再读取旧的“图片同目录 txt”布局。
 
 ## 使用方式
 
@@ -27,9 +29,11 @@ dotnet run --project .\Pek.AI.StampAnnotationTool\Pek.AI.StampAnnotationTool.csp
 7. 方向键微调选中框位置，`Shift + 方向键` 调整选中框大小
 8. 鼠标滚轮缩放，按住中键拖动画布平移，双击画布重置视图
 9. 可以点击“自动预标注当前”或“自动预标注未标注”，先生成候选框再人工修正
-10. `Delete` 删除最后一个框，`PageUp/PageDown` 切换图片，`Ctrl+S` 保存
-11. 点击“保存当前”或“全部保存”
-12. 点击“导出 YOLO 数据集”生成训练目录
+10. 默认开启“自动保存”，切换图片时会自动保存当前图片的标注
+11. `Delete` 删除最后一个框，`PageUp/PageDown` 切换图片，`Ctrl+S` 保存
+12. 点击“保存当前”或“全部保存”
+13. 点击“导出 YOLO 数据集”生成训练目录
+14. 点击“导出轻量标签”只导出标签文件、`labels.txt` 和 `annotations.json`
 
 ## 与当前 ONNX Demo 的配合
 
@@ -51,3 +55,13 @@ dotnet run --project .\Pek.AI.StampDetectionDemo\Pek.AI.StampDetectionDemo.cspro
 4. 候选去重与邻近合并
 
 它的定位是“先出初始框，减少手工框选时间”，不是最终训练标签。导出的训练数据仍建议人工复核一遍，尤其是复杂背景、电子章、浅色章和骑缝章场景。
+
+## 轻量导出说明
+
+“导出轻量标签”不会复制原始图片，只会导出：
+
+1. `labels/` 目录下的标签文件
+2. `labels.txt`
+3. `annotations.json`
+
+适合图片已经由其他流程统一管理、你只想单独打包标签结果的场景。

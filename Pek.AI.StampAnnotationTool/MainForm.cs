@@ -28,6 +28,7 @@ internal sealed class MainForm : Form
     private readonly ListBox _imageListBox;
     private readonly AnnotationCanvas _canvas;
     private readonly ComboBox _classComboBox;
+    private readonly CheckBox _autoSaveCheckBox;
     private readonly TextBox _labelsTextBox;
     private readonly Label _statusLabel;
     private readonly StampPreAnnotationDetector _preAnnotationDetector = new();
@@ -92,7 +93,7 @@ internal sealed class MainForm : Form
         leftLayout.Controls.Add(labelsPanel, 0, 1);
 
         _imageListBox = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false };
-        _imageListBox.SelectedIndexChanged += (_, _) => LoadSelectedImage();
+        _imageListBox.SelectedIndexChanged += (_, _) => OnSelectedImageChanged();
         leftLayout.Controls.Add(_imageListBox, 0, 2);
 
         var navigationPanel = new FlowLayoutPanel
@@ -105,6 +106,8 @@ internal sealed class MainForm : Form
         };
         navigationPanel.Controls.Add(CreateActionButton("上一张", (_, _) => Navigate(-1)));
         navigationPanel.Controls.Add(CreateActionButton("下一张", (_, _) => Navigate(1)));
+        _autoSaveCheckBox = new CheckBox { Text = "自动保存", AutoSize = true, Checked = true, Margin = new Padding(8, 8, 0, 0) };
+        navigationPanel.Controls.Add(_autoSaveCheckBox);
         navigationPanel.Controls.Add(CreateActionButton("保存当前", (_, _) => SaveCurrentAnnotations()));
         navigationPanel.Controls.Add(CreateActionButton("全部保存", (_, _) => SaveAllAnnotations()));
         leftLayout.Controls.Add(navigationPanel, 0, 3);
@@ -118,6 +121,7 @@ internal sealed class MainForm : Form
             Margin = new Padding(0, 8, 0, 0)
         };
         exportPanel.Controls.Add(CreateActionButton("导出 YOLO 数据集", (_, _) => ExportDataset()));
+        exportPanel.Controls.Add(CreateActionButton("导出轻量标签", (_, _) => ExportLabelBundle()));
         exportPanel.Controls.Add(CreateActionButton("自动预标注当前", (_, _) => AutoAnnotateCurrent()));
         exportPanel.Controls.Add(CreateActionButton("自动预标注未标注", (_, _) => AutoAnnotateUnlabeled()));
         exportPanel.Controls.Add(CreateActionButton("重置视图", (_, _) => ResetCanvasView()));
@@ -379,6 +383,14 @@ internal sealed class MainForm : Form
             _classComboBox.SelectedIndex = Math.Min(Math.Max(0, _classComboBox.SelectedIndex), _classComboBox.Items.Count - 1);
     }
 
+    private void OnSelectedImageChanged()
+    {
+        if (_autoSaveCheckBox.Checked)
+            SaveCurrentAnnotations();
+
+        LoadSelectedImage();
+    }
+
     private void LoadSelectedImage()
     {
         if (_imageListBox.SelectedIndex < 0 || _imageListBox.SelectedIndex >= _imageFiles.Count)
@@ -552,6 +564,52 @@ internal sealed class MainForm : Form
         MessageBox.Show(this, $"已导出 {labeledImages.Length} 张已标注图片。", "导出完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
+    private void ExportLabelBundle()
+    {
+        if (_imageFiles.Count == 0)
+        {
+            MessageBox.Show(this, "当前没有可导出的图片。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        SaveAllAnnotations();
+
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = "选择轻量标签导出目录",
+            ShowNewFolderButton = true,
+            InitialDirectory = _currentFolder ?? AppContext.BaseDirectory
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+            return;
+
+        var outputFolder = dialog.SelectedPath;
+        var labelsFolder = Path.Combine(outputFolder, "labels");
+        Directory.CreateDirectory(labelsFolder);
+
+        var labeledImages = _imageFiles
+            .Where(path => _documents.TryGetValue(path, out var document) && document.Annotations.Count > 0)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        foreach (var imagePath in labeledImages)
+        {
+            var sourceLabelPath = GetLabelPath(imagePath);
+            if (!File.Exists(sourceLabelPath))
+                continue;
+
+            var targetLabelPath = Path.Combine(labelsFolder, Path.GetFileName(sourceLabelPath));
+            File.Copy(sourceLabelPath, targetLabelPath, overwrite: true);
+        }
+
+        File.WriteAllLines(Path.Combine(outputFolder, "labels.txt"), _labels, Encoding.UTF8);
+        File.WriteAllText(Path.Combine(outputFolder, "annotations.json"), JsonSerializer.Serialize(BuildManifestItems(), new JsonSerializerOptions { WriteIndented = true }), Encoding.UTF8);
+
+        _statusLabel.Text = $"已导出轻量标签：{outputFolder}";
+        MessageBox.Show(this, $"已导出 {labeledImages.Length} 张图片对应的标签文件。", "导出完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
     private void AutoAnnotateCurrent()
     {
         if (String.IsNullOrWhiteSpace(_currentImagePath))
@@ -647,7 +705,7 @@ internal sealed class MainForm : Form
         return _imageFiles.Select(path => new AnnotationManifestItem
         {
             ImageFile = Path.GetFileName(path),
-            AnnotationFile = Path.GetFileName(GetLabelPath(path)),
+            AnnotationFile = Path.Combine("labels", Path.GetFileName(GetLabelPath(path))).Replace('\\', '/'),
             Count = _documents[path].Annotations.Count
         }).ToArray();
     }
@@ -655,6 +713,7 @@ internal sealed class MainForm : Form
     private void WriteAnnotations(String imagePath, AnnotationDocument document)
     {
         var labelPath = GetLabelPath(imagePath);
+        Directory.CreateDirectory(Path.GetDirectoryName(labelPath)!);
         var lines = document.Annotations.Select(annotation => FormatAnnotation(annotation)).ToArray();
         File.WriteAllLines(labelPath, lines, Encoding.UTF8);
     }
@@ -682,7 +741,12 @@ internal sealed class MainForm : Form
             annotation.NormalizedBox.Height.ToString("0.######", CultureInfo.InvariantCulture));
     }
 
-    private static String GetLabelPath(String imagePath) => Path.ChangeExtension(imagePath, ".txt");
+    private static String GetLabelPath(String imagePath)
+    {
+        var imageFolder = Path.GetDirectoryName(imagePath) ?? AppContext.BaseDirectory;
+        var labelsFolder = Path.Combine(imageFolder, "labels");
+        return Path.Combine(labelsFolder, Path.ChangeExtension(Path.GetFileName(imagePath), ".txt"));
+    }
 
     private void RefreshImageListDisplay()
     {
