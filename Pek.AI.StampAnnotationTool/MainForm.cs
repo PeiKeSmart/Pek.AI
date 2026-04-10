@@ -27,6 +27,7 @@ namespace Pek.AI.StampAnnotationTool;
 internal sealed class MainForm : Form
 {
     private static readonly String[] SupportedExtensions = [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"];
+    private static readonly UTF8Encoding Utf8WithoutBom = new(false);
 
     private readonly ListBox _imageListBox;
     private readonly SplitContainer _mainSplit;
@@ -892,6 +893,8 @@ internal sealed class MainForm : Form
             return;
         }
 
+        var resolvedBaseModel = ResolveBaseModelPath(baseModel, trainingScriptPath);
+
         _isTraining = true;
         SetTrainingControlsEnabled(false);
         ClearTrainingLog();
@@ -899,11 +902,13 @@ internal sealed class MainForm : Form
         AppendTrainingLog($"数据集目录: {datasetFolder}");
         AppendTrainingLog($"运行目录: {runRoot}");
         AppendTrainingLog($"运行名称: {runName}");
+        AppendTrainingLog($"基础模型输入: {baseModel}");
+        AppendTrainingLog($"基础模型实际使用: {resolvedBaseModel}");
         _statusLabel.Text = $"开始训练：数据集 {datasetFolder}，运行名 {runName}";
 
         try
         {
-            var processResult = await RunTrainingProcessAsync(trainingScriptPath, datasetFolder, runRoot, runName, baseModel, imageSize, epochs, batch, device, AppendTrainingLog);
+            var processResult = await RunTrainingProcessAsync(trainingScriptPath, datasetFolder, runRoot, runName, resolvedBaseModel, imageSize, epochs, batch, device, AppendTrainingLog);
             if (processResult.ExitCode != 0)
             {
                 AppendTrainingLog($"[{DateTime.Now:HH:mm:ss}] 训练失败，退出码: {processResult.ExitCode}");
@@ -913,11 +918,15 @@ internal sealed class MainForm : Form
             }
 
             var onnxPath = Path.Combine(runRoot, runName, "weights", "best.onnx");
-            if (_openOnnxAfterTrainCheckBox.Checked && File.Exists(onnxPath))
+            if (File.Exists(onnxPath))
             {
-                _modelPathTextBox.Text = onnxPath;
-                _statusLabel.Text = $"训练完成，已导出 ONNX：{onnxPath}";
+                var stableOnnxPath = PublishStableModelArtifacts(onnxPath, datasetFolder);
+                if (_openOnnxAfterTrainCheckBox.Checked)
+                    _modelPathTextBox.Text = stableOnnxPath;
+
+                _statusLabel.Text = $"训练完成，已导出 ONNX：{stableOnnxPath}";
                 AppendTrainingLog($"[{DateTime.Now:HH:mm:ss}] 训练完成，已生成: {onnxPath}");
+                AppendTrainingLog($"[{DateTime.Now:HH:mm:ss}] 已发布固定模型路径: {stableOnnxPath}");
             }
             else
             {
@@ -986,6 +995,52 @@ internal sealed class MainForm : Form
             else if (Width >= 1050)
                 _mainSplit.SplitterDistance = 500;
         }));
+    }
+
+    private String PublishStableModelArtifacts(String onnxPath, String datasetFolder)
+    {
+        if (String.IsNullOrWhiteSpace(_currentFolder))
+            return onnxPath;
+
+        var stableModelFolder = Path.Combine(_currentFolder, "model");
+        Directory.CreateDirectory(stableModelFolder);
+
+        var stableOnnxPath = Path.Combine(stableModelFolder, "stamp-detector.onnx");
+        File.Copy(onnxPath, stableOnnxPath, overwrite: true);
+
+        var labelsPath = Path.Combine(datasetFolder, "labels.txt");
+        if (File.Exists(labelsPath))
+            File.Copy(labelsPath, Path.Combine(stableModelFolder, "labels.txt"), overwrite: true);
+
+        var latestRunPath = Path.Combine(stableModelFolder, "latest-run.txt");
+        File.WriteAllText(latestRunPath, onnxPath, Utf8WithoutBom);
+        return stableOnnxPath;
+    }
+
+    private String ResolveBaseModelPath(String modelInput, String trainingScriptPath)
+    {
+        if (Path.IsPathRooted(modelInput) && File.Exists(modelInput))
+            return modelInput;
+
+        var toolProjectRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", ".."));
+        var toolOutputRoot = AppContext.BaseDirectory;
+        var imageFolder = _currentFolder ?? String.Empty;
+        var trainingScriptFolder = Path.GetDirectoryName(trainingScriptPath) ?? String.Empty;
+        var candidatePaths = new[]
+        {
+            Path.Combine(toolProjectRoot, modelInput),
+            Path.Combine(toolOutputRoot, modelInput),
+            String.IsNullOrWhiteSpace(imageFolder) ? String.Empty : Path.Combine(imageFolder, modelInput),
+            Path.Combine(trainingScriptFolder, modelInput)
+        };
+
+        foreach (var candidate in candidatePaths.Where(path => !String.IsNullOrWhiteSpace(path)).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (File.Exists(candidate))
+                return candidate;
+        }
+
+        return modelInput;
     }
 
     private static async Task<TrainingProcessResult> RunTrainingProcessAsync(String trainingScriptPath, String datasetFolder, String runRoot, String runName, String baseModel, Int32 imageSize, Int32 epochs, Int32 batch, String device, Action<String>? logCallback)
@@ -1157,7 +1212,7 @@ internal sealed class MainForm : Form
         var labelPath = GetLabelPath(imagePath);
         Directory.CreateDirectory(Path.GetDirectoryName(labelPath)!);
         var lines = document.Annotations.Select(annotation => FormatAnnotation(annotation)).ToArray();
-        File.WriteAllLines(labelPath, lines, Encoding.UTF8);
+        File.WriteAllLines(labelPath, lines, Utf8WithoutBom);
     }
 
     private void WriteLabelsManifest(String folderPath)
