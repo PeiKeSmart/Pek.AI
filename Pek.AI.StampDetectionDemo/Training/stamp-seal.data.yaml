@@ -1,0 +1,6 @@
+path: D:/dataset/stamp-seal
+train: images/train
+val: images/val
+
+names:
+  0: seal

@@ -9,4 +9,5 @@
     <File Path="Readme.MD" />
   </Folder>
   <Project Path="Pek.AI/Pek.AI.csproj" />
+  <Project Path="Pek.AI.StampDetectionDemo/Pek.AI.StampDetectionDemo.csproj" />
 </Solution>
