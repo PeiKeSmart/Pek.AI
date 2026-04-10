@@ -285,14 +285,12 @@ internal sealed class StampDetectionPipeline
 
     private static Boolean TryFitSealDisplayRect(Mat image, Rect detectionBox, out Rect fittedRect)
     {
-        var padded = InflateRect(detectionBox, image.Width, image.Height, 24);
-        using var roi = new Mat(image, padded);
         using var hsv = new Mat();
         using var mask1 = new Mat();
         using var mask2 = new Mat();
         using var redMask = new Mat();
 
-        Cv2.CvtColor(roi, hsv, ColorConversionCodes.BGR2HSV);
+        Cv2.CvtColor(image, hsv, ColorConversionCodes.BGR2HSV);
         Cv2.InRange(hsv, new Scalar(0, 80, 60), new Scalar(15, 255, 255), mask1);
         Cv2.InRange(hsv, new Scalar(160, 80, 60), new Scalar(180, 255, 255), mask2);
         Cv2.BitwiseOr(mask1, mask2, redMask);
@@ -304,7 +302,7 @@ internal sealed class StampDetectionPipeline
             return false;
         }
 
-        var anchorCenter = new Point2f(detectionBox.X + detectionBox.Width / 2f - padded.X, detectionBox.Y + detectionBox.Height / 2f - padded.Y);
+        var anchorCenter = new Point2f(detectionBox.X + detectionBox.Width / 2f, detectionBox.Y + detectionBox.Height / 2f);
         var selectedContours = contours
             .Select(contour => new
             {
@@ -313,8 +311,8 @@ internal sealed class StampDetectionPipeline
                 Area = Cv2.ContourArea(contour)
             })
             .Where(item => item.Area >= 50)
-            .OrderBy(item => DistanceToRectCenter(item.Rect, anchorCenter))
-            .ThenByDescending(item => item.Area)
+            .Where(item => MatchesPartialDisplayContour(item.Rect, detectionBox, image.Width, image.Height))
+            .OrderByDescending(item => ScorePartialDisplayContour(item.Rect, item.Area, detectionBox, anchorCenter))
             .Take(2)
             .ToArray();
 
@@ -338,12 +336,99 @@ internal sealed class StampDetectionPipeline
             return false;
         }
 
-        var left = Math.Clamp((Int32)MathF.Floor(center.X - radius) + padded.X, 0, Math.Max(0, image.Width - 1));
-        var top = Math.Clamp((Int32)MathF.Floor(center.Y - radius) + padded.Y, 0, Math.Max(0, image.Height - 1));
-        var right = Math.Clamp((Int32)MathF.Ceiling(center.X + radius) + padded.X, left + 1, image.Width);
-        var bottom = Math.Clamp((Int32)MathF.Ceiling(center.Y + radius) + padded.Y, top + 1, image.Height);
+        var left = Math.Clamp((Int32)MathF.Floor(center.X - radius), 0, Math.Max(0, image.Width - 1));
+        var top = Math.Clamp((Int32)MathF.Floor(center.Y - radius), 0, Math.Max(0, image.Height - 1));
+        var right = Math.Clamp((Int32)MathF.Ceiling(center.X + radius), left + 1, image.Width);
+        var bottom = Math.Clamp((Int32)MathF.Ceiling(center.Y + radius), top + 1, image.Height);
         fittedRect = new Rect(left, top, right - left, bottom - top);
         return fittedRect.Width > 0 && fittedRect.Height > 0;
+    }
+
+    private static Boolean MatchesPartialDisplayContour(Rect contourRect, Rect detectionBox, Int32 imageWidth, Int32 imageHeight)
+    {
+        var touchesLeft = detectionBox.Left <= 6;
+        var touchesTop = detectionBox.Top <= 6;
+        var touchesRight = detectionBox.Right >= imageWidth - 6;
+        var touchesBottom = detectionBox.Bottom >= imageHeight - 6;
+        var contourCenterX = contourRect.X + contourRect.Width / 2f;
+        var contourCenterY = contourRect.Y + contourRect.Height / 2f;
+        var detectionCenterX = detectionBox.X + detectionBox.Width / 2f;
+        var detectionCenterY = detectionBox.Y + detectionBox.Height / 2f;
+
+        if (touchesLeft && contourRect.Left > 12)
+            return false;
+
+        if (touchesTop && contourRect.Top > 12)
+            return false;
+
+        if (touchesRight && contourRect.Right < imageWidth - 12)
+            return false;
+
+        if (touchesBottom && contourRect.Bottom < imageHeight - 12)
+            return false;
+
+        if ((touchesTop || touchesBottom) && !touchesLeft && !touchesRight)
+        {
+            var allowedCenterDeltaX = Math.Max(80f, detectionBox.Width * 0.95f);
+            if (Math.Abs(contourCenterX - detectionCenterX) > allowedCenterDeltaX)
+                return false;
+        }
+
+        if ((touchesLeft || touchesRight) && !touchesTop && !touchesBottom)
+        {
+            var allowedCenterDeltaY = Math.Max(80f, detectionBox.Height * 0.95f);
+            if (Math.Abs(contourCenterY - detectionCenterY) > allowedCenterDeltaY)
+                return false;
+        }
+
+        if ((touchesTop || touchesBottom) && (touchesLeft || touchesRight))
+        {
+            var allowedCenterDeltaX = Math.Max(96f, detectionBox.Width * 1.1f);
+            var allowedCenterDeltaY = Math.Max(96f, detectionBox.Height * 1.1f);
+            if (Math.Abs(contourCenterX - detectionCenterX) > allowedCenterDeltaX || Math.Abs(contourCenterY - detectionCenterY) > allowedCenterDeltaY)
+                return false;
+        }
+
+        var union = UnionRects(contourRect, detectionBox);
+        var maxWidth = Math.Max(contourRect.Width, detectionBox.Width);
+        var maxHeight = Math.Max(contourRect.Height, detectionBox.Height);
+        return union.Width <= maxWidth * 3.2f && union.Height <= maxHeight * 3.2f;
+    }
+
+    private static Single ScorePartialDisplayContour(Rect contourRect, Double area, Rect detectionBox, Point2f anchorCenter)
+    {
+        var edgeBonus = 0f;
+        if (detectionBox.Left <= 6 && contourRect.Left <= 12)
+            edgeBonus += 2.5f;
+
+        if (detectionBox.Top <= 6 && contourRect.Top <= 12)
+            edgeBonus += 2.5f;
+
+        if (detectionBox.Right >= contourRect.Right - 6 || contourRect.Right >= detectionBox.Right)
+            edgeBonus += 1f;
+
+        if (detectionBox.Bottom >= contourRect.Bottom - 6 || contourRect.Bottom >= detectionBox.Bottom)
+            edgeBonus += 1f;
+
+        if (detectionBox.Right >= contourRect.Right - 6 && contourRect.Right >= detectionBox.Right)
+            edgeBonus += 1.5f;
+
+        if (detectionBox.Bottom >= contourRect.Bottom - 6 && contourRect.Bottom >= detectionBox.Bottom)
+            edgeBonus += 1.5f;
+
+        var sizeBonus = MathF.Min(6f, MathF.Max(contourRect.Width, contourRect.Height) / Math.Max(1f, MathF.Max(detectionBox.Width, detectionBox.Height)));
+        var areaBonus = MathF.Min(4f, (Single)Math.Sqrt(Math.Max(1d, area)) / 20f);
+        var distancePenalty = DistanceToRectCenter(contourRect, anchorCenter) / Math.Max(20f, MathF.Max(detectionBox.Width, detectionBox.Height));
+        return edgeBonus + sizeBonus + areaBonus - distancePenalty;
+    }
+
+    private static Rect UnionRects(Rect first, Rect second)
+    {
+        var left = Math.Min(first.Left, second.Left);
+        var top = Math.Min(first.Top, second.Top);
+        var right = Math.Max(first.Right, second.Right);
+        var bottom = Math.Max(first.Bottom, second.Bottom);
+        return new Rect(left, top, right - left, bottom - top);
     }
 
     private static Rect InflateRect(Rect rect, Int32 imageWidth, Int32 imageHeight, Int32 padding)
