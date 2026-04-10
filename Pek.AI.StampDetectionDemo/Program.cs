@@ -277,10 +277,91 @@ internal sealed class StampDetectionPipeline
 
     private static Rect GetDisplayRectForDrawing(Mat image, SealDetection detection)
     {
-        if (detection.Label != "partial-seal" || !detection.Source.Contains("opencv", StringComparison.OrdinalIgnoreCase))
+        if (!detection.Source.Contains("opencv-red", StringComparison.OrdinalIgnoreCase))
             return detection.Box;
 
-        return TryFitSealDisplayRect(image, detection.Box, out var fittedRect) ? fittedRect : detection.Box;
+        if (detection.Label == "partial-seal")
+            return TryFitSealDisplayRect(image, detection.Box, out var partialRect) ? partialRect : detection.Box;
+
+        return TryFitFullRedSealDisplayRect(image, detection.Box, out var fittedRect) ? fittedRect : detection.Box;
+    }
+
+    private static Boolean TryFitFullRedSealDisplayRect(Mat image, Rect detectionBox, out Rect fittedRect)
+    {
+        var padded = InflateRect(detectionBox, image.Width, image.Height, 18);
+        using var roi = new Mat(image, padded);
+        using var hsv = new Mat();
+        using var mask1 = new Mat();
+        using var mask2 = new Mat();
+        using var redMask = new Mat();
+
+        Cv2.CvtColor(roi, hsv, ColorConversionCodes.BGR2HSV);
+        Cv2.InRange(hsv, new Scalar(0, 80, 60), new Scalar(15, 255, 255), mask1);
+        Cv2.InRange(hsv, new Scalar(160, 80, 60), new Scalar(180, 255, 255), mask2);
+        Cv2.BitwiseOr(mask1, mask2, redMask);
+
+        Cv2.FindContours(redMask, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+        if (contours.Length == 0)
+        {
+            fittedRect = detectionBox;
+            return false;
+        }
+
+        var focusWindow = InflateRect(
+            new Rect(detectionBox.X - padded.X, detectionBox.Y - padded.Y, detectionBox.Width, detectionBox.Height),
+            padded.Width,
+            padded.Height,
+            12);
+        var focusCenter = new Point2f(focusWindow.X + focusWindow.Width / 2f, focusWindow.Y + focusWindow.Height / 2f);
+
+        var selectedContours = contours
+            .Select(contour => new
+            {
+                Contour = contour,
+                Rect = Cv2.BoundingRect(contour),
+                Area = Cv2.ContourArea(contour),
+                Perimeter = Cv2.ArcLength(contour, true)
+            })
+            .Where(item => item.Area >= 50 && item.Perimeter > 0)
+            .Select(item => new
+            {
+                item.Contour,
+                item.Rect,
+                item.Area,
+                Circularity = (Single)(4 * Math.PI * item.Area / (item.Perimeter * item.Perimeter))
+            })
+            .Where(item => item.Rect.IntersectsWith(focusWindow) || ContainsPoint(item.Rect, focusCenter))
+            .Where(item => item.Circularity >= 0.03f)
+            .OrderByDescending(item => ScoreFullRedDisplayContour(item.Rect, item.Area, item.Circularity, focusCenter, focusWindow))
+            .Take(3)
+            .ToArray();
+
+        if (selectedContours.Length == 0)
+        {
+            fittedRect = detectionBox;
+            return false;
+        }
+
+        var allPoints = selectedContours.SelectMany(item => item.Contour).ToArray();
+        if (allPoints.Length < 5)
+        {
+            fittedRect = detectionBox;
+            return false;
+        }
+
+        Cv2.MinEnclosingCircle(allPoints, out var center, out var radius);
+        if (radius <= 1f)
+        {
+            fittedRect = detectionBox;
+            return false;
+        }
+
+        var left = Math.Clamp((Int32)MathF.Floor(center.X - radius) + padded.X, 0, Math.Max(0, image.Width - 1));
+        var top = Math.Clamp((Int32)MathF.Floor(center.Y - radius) + padded.Y, 0, Math.Max(0, image.Height - 1));
+        var right = Math.Clamp((Int32)MathF.Ceiling(center.X + radius) + padded.X, left + 1, image.Width);
+        var bottom = Math.Clamp((Int32)MathF.Ceiling(center.Y + radius) + padded.Y, top + 1, image.Height);
+        fittedRect = new Rect(left, top, right - left, bottom - top);
+        return fittedRect.Width > 0 && fittedRect.Height > 0;
     }
 
     private static Boolean TryFitSealDisplayRect(Mat image, Rect detectionBox, out Rect fittedRect)
@@ -420,6 +501,38 @@ internal sealed class StampDetectionPipeline
         var areaBonus = MathF.Min(4f, (Single)Math.Sqrt(Math.Max(1d, area)) / 20f);
         var distancePenalty = DistanceToRectCenter(contourRect, anchorCenter) / Math.Max(20f, MathF.Max(detectionBox.Width, detectionBox.Height));
         return edgeBonus + sizeBonus + areaBonus - distancePenalty;
+    }
+
+    private static Single ScoreFullRedDisplayContour(Rect contourRect, Double area, Single circularity, Point2f focusCenter, Rect focusWindow)
+    {
+        var areaBonus = MathF.Min(4f, (Single)Math.Sqrt(Math.Max(1d, area)) / 18f);
+        var circularityBonus = MathF.Max(0f, circularity) * 5f;
+        var overlapBonus = ComputeRectIouLocal(contourRect, focusWindow) * 4f;
+        var distancePenalty = DistanceToRectCenter(contourRect, focusCenter) / Math.Max(24f, MathF.Max(focusWindow.Width, focusWindow.Height) * 0.4f);
+        return areaBonus + circularityBonus + overlapBonus - distancePenalty;
+    }
+
+    private static Boolean ContainsPoint(Rect rect, Point2f point)
+    {
+        return point.X >= rect.Left && point.X <= rect.Right && point.Y >= rect.Top && point.Y <= rect.Bottom;
+    }
+
+    private static Single ComputeRectIouLocal(Rect first, Rect second)
+    {
+        var x1 = Math.Max(first.Left, second.Left);
+        var y1 = Math.Max(first.Top, second.Top);
+        var x2 = Math.Min(first.Right, second.Right);
+        var y2 = Math.Min(first.Bottom, second.Bottom);
+        var intersectionWidth = Math.Max(0, x2 - x1);
+        var intersectionHeight = Math.Max(0, y2 - y1);
+        var intersection = intersectionWidth * intersectionHeight;
+        if (intersection <= 0)
+            return 0;
+
+        var firstArea = first.Width * first.Height;
+        var secondArea = second.Width * second.Height;
+        var union = firstArea + secondArea - intersection;
+        return union <= 0 ? 0 : intersection / (Single)union;
     }
 
     private static Rect UnionRects(Rect first, Rect second)
