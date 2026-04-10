@@ -50,6 +50,7 @@ internal static class Program
         Console.WriteLine("示例:");
         Console.WriteLine("  dotnet run --project Pek.AI.StampDetectionDemo -- --input sample.jpg");
         Console.WriteLine("  dotnet run --project Pek.AI.StampDetectionDemo -- --input sample.pdf --model seal.onnx --labels seal");
+        Console.WriteLine("  dotnet run --project Pek.AI.StampDetectionDemo -- --input sample.pdf --model seal.onnx --labels-file labels.txt");
         Console.WriteLine();
         Console.WriteLine("参数:");
         Console.WriteLine("  --input   必填，图片或 PDF 路径");
@@ -59,6 +60,7 @@ internal static class Program
         Console.WriteLine("  --iou     可选，NMS 阈值，默认 0.45");
         Console.WriteLine("  --size    可选，输入尺寸，默认 640");
         Console.WriteLine("  --labels  可选，类别名，逗号分隔，默认 seal");
+        Console.WriteLine("  --labels-file 可选，标签文件路径，每行一个类别名");
     }
 }
 
@@ -78,11 +80,14 @@ internal sealed class StampDetectionOptions
 
     public IReadOnlyList<String> Labels { get; init; } = ["seal"];
 
+    public String? LabelsFilePath { get; init; }
+
     public static StampDetectionOptions Parse(String[] args)
     {
         String? inputPath = null;
         String? modelPath = null;
         String? outputDirectory = null;
+        String? labelsFilePath = null;
         var confidenceThreshold = 0.25f;
         var iouThreshold = 0.45f;
         var inputSize = 640;
@@ -121,6 +126,9 @@ internal sealed class StampDetectionOptions
                 case "--labels":
                     labels = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
                     break;
+                case "--labels-file":
+                    labelsFilePath = Path.GetFullPath(value);
+                    break;
                 default:
                     throw new ArgumentException($"未知参数: {key}");
             }
@@ -135,6 +143,20 @@ internal sealed class StampDetectionOptions
         if (!String.IsNullOrWhiteSpace(modelPath) && !File.Exists(modelPath))
             throw new FileNotFoundException($"模型文件不存在: {modelPath}");
 
+        if (!String.IsNullOrWhiteSpace(labelsFilePath))
+        {
+            if (!File.Exists(labelsFilePath))
+                throw new FileNotFoundException($"标签文件不存在: {labelsFilePath}");
+
+            labels = File.ReadAllLines(labelsFilePath)
+                .Select(item => item.Trim())
+                .Where(item => !String.IsNullOrWhiteSpace(item))
+                .ToArray();
+
+            if (labels.Count == 0)
+                throw new ArgumentException($"标签文件为空: {labelsFilePath}");
+        }
+
         outputDirectory ??= Path.Combine(
             Path.GetDirectoryName(inputPath) ?? AppContext.BaseDirectory,
             $"output_{DateTime.Now:yyyyMMdd_HHmmss}");
@@ -147,7 +169,8 @@ internal sealed class StampDetectionOptions
             ConfidenceThreshold = confidenceThreshold,
             IouThreshold = iouThreshold,
             InputSize = inputSize,
-            Labels = labels
+            Labels = labels,
+            LabelsFilePath = labelsFilePath
         };
     }
 }
