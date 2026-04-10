@@ -418,10 +418,67 @@ internal sealed class OpenCvSealCandidateDetector
             if (partialCandidate)
                 score = MathF.Max(score, 0.38f);
 
-            detections.Add(new SealDetection(rect, MathF.Min(0.95f, score), 0, partialCandidate ? "partial-seal" : "seal", channelName));
+            var finalRect = partialCandidate && String.Equals(channelName, "opencv-red", StringComparison.Ordinal)
+                ? ExpandPartialDetectionRect(rect, source.Width, source.Height)
+                : rect;
+            detections.Add(new SealDetection(finalRect, MathF.Min(0.95f, score), 0, partialCandidate ? "partial-seal" : "seal", channelName));
         }
 
         return detections;
+    }
+
+    private static Rect ExpandPartialDetectionRect(Rect rect, Int32 imageWidth, Int32 imageHeight)
+    {
+        var touchesLeft = rect.Left <= 6;
+        var touchesTop = rect.Top <= 6;
+        var touchesRight = rect.Right >= imageWidth - 6;
+        var touchesBottom = rect.Bottom >= imageHeight - 6;
+
+        var targetSize = Math.Max(rect.Width, rect.Height) * 2.2f;
+        Single expandedLeft = rect.Left;
+        Single expandedTop = rect.Top;
+        Single expandedRight = rect.Right;
+        Single expandedBottom = rect.Bottom;
+
+        if (touchesLeft)
+        {
+            expandedLeft = 0;
+            expandedRight = Math.Max(expandedRight, targetSize);
+        }
+        else if (touchesRight)
+        {
+            expandedRight = imageWidth;
+            expandedLeft = Math.Min(expandedLeft, imageWidth - targetSize);
+        }
+        else
+        {
+            var centerX = rect.Left + rect.Width / 2f;
+            expandedLeft = centerX - targetSize / 2f;
+            expandedRight = centerX + targetSize / 2f;
+        }
+
+        if (touchesTop)
+        {
+            expandedTop = 0;
+            expandedBottom = Math.Max(expandedBottom, targetSize);
+        }
+        else if (touchesBottom)
+        {
+            expandedBottom = imageHeight;
+            expandedTop = Math.Min(expandedTop, imageHeight - targetSize);
+        }
+        else
+        {
+            var centerY = rect.Top + rect.Height / 2f;
+            expandedTop = centerY - targetSize / 2f;
+            expandedBottom = centerY + targetSize / 2f;
+        }
+
+        var left = Math.Clamp((Int32)MathF.Floor(expandedLeft), 0, Math.Max(0, imageWidth - 1));
+        var top = Math.Clamp((Int32)MathF.Floor(expandedTop), 0, Math.Max(0, imageHeight - 1));
+        var right = Math.Clamp((Int32)MathF.Ceiling(expandedRight), left + 1, imageWidth);
+        var bottom = Math.Clamp((Int32)MathF.Ceiling(expandedBottom), top + 1, imageHeight);
+        return new Rect(left, top, right - left, bottom - top);
     }
 
     private static Boolean TouchesImageEdge(Rect rect, Int32 width, Int32 height)
