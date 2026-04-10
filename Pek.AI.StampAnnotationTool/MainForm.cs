@@ -44,6 +44,7 @@ internal sealed class MainForm : Form
     private readonly TextBox _trainDeviceTextBox;
     private readonly Button _trainButton;
     private readonly TextBox _trainLogTextBox;
+    private readonly Label _preAnnotationSourceLabel;
     private readonly Label _statusLabel;
     private readonly StampPreAnnotationDetector _preAnnotationDetector = new();
     private readonly Dictionary<String, AnnotationDocument> _documents = new(StringComparer.OrdinalIgnoreCase);
@@ -125,6 +126,8 @@ internal sealed class MainForm : Form
         browseModelButton.Click += (_, _) => SelectOnnxModel();
         modelPanel.Controls.Add(browseModelButton);
         labelsPanel.Controls.Add(modelPanel, 0, 3);
+        _preAnnotationSourceLabel = new Label { Text = "预标注来源：OpenCV 回退", AutoSize = true, Margin = new Padding(0, 6, 0, 0) };
+        labelsPanel.Controls.Add(_preAnnotationSourceLabel, 0, 4);
         leftLayout.Controls.Add(labelsPanel, 0, 1);
 
         _imageListBox = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false, HorizontalScrollbar = true };
@@ -376,6 +379,7 @@ internal sealed class MainForm : Form
             .ToArray();
 
         _imageFiles.AddRange(images);
+        TryAutoLoadPublishedModel(folderPath);
         LoadLabelsFromFolderIfPresent(folderPath);
 
         foreach (var imageFile in _imageFiles)
@@ -398,6 +402,34 @@ internal sealed class MainForm : Form
         _suppressImageSelectionChanged = false;
         if (_imageFiles.Count > 0)
             LoadSelectedImage();
+    }
+
+    private void TryAutoLoadPublishedModel(String folderPath)
+    {
+        var stableModelPath = Path.Combine(folderPath, "model", "stamp-detector.onnx");
+        if (!File.Exists(stableModelPath))
+            return;
+
+        _modelPathTextBox.Text = stableModelPath;
+        _statusLabel.Text = $"已自动加载模型：{Path.GetFileName(stableModelPath)}";
+        _preAnnotationSourceLabel.Text = $"预标注来源：训练模型 {Path.GetFileName(stableModelPath)}";
+
+        var modelLabelsPath = Path.Combine(folderPath, "model", "labels.txt");
+        if (File.Exists(modelLabelsPath))
+        {
+            var labels = File.ReadAllLines(modelLabelsPath, Encoding.UTF8)
+                .Select(item => item.Trim())
+                .Where(item => !String.IsNullOrWhiteSpace(item))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (labels.Count > 0)
+            {
+                _labels = labels;
+                _labelsTextBox.Text = String.Join(',', _labels);
+                UpdateClassComboBox();
+            }
+        }
     }
 
     private void ReloadLabelsFromFolder()
@@ -637,7 +669,7 @@ internal sealed class MainForm : Form
 
     private Int32 ExportDatasetToFolder(String outputFolder)
     {
-        Directory.CreateDirectory(outputFolder);
+        PrepareDatasetOutputFolder(outputFolder);
 
         var trainImageFolder = Path.Combine(outputFolder, "images", "train");
         var valImageFolder = Path.Combine(outputFolder, "images", "val");
@@ -656,18 +688,55 @@ internal sealed class MainForm : Form
         for (var index = 0; index < labeledImages.Length; index++)
         {
             var imagePath = labeledImages[index];
+            var fileName = Path.GetFileName(imagePath);
+            var labelFileName = Path.ChangeExtension(fileName, ".txt");
+
+            if (labeledImages.Length <= 5)
+            {
+                File.Copy(imagePath, Path.Combine(trainImageFolder, fileName), overwrite: true);
+                File.Copy(GetLabelPath(imagePath), Path.Combine(trainLabelFolder, labelFileName), overwrite: true);
+                File.Copy(imagePath, Path.Combine(valImageFolder, fileName), overwrite: true);
+                File.Copy(GetLabelPath(imagePath), Path.Combine(valLabelFolder, labelFileName), overwrite: true);
+                continue;
+            }
+
             var subset = index % 5 == 0 ? "val" : "train";
             var targetImageFolder = subset == "val" ? valImageFolder : trainImageFolder;
             var targetLabelFolder = subset == "val" ? valLabelFolder : trainLabelFolder;
-            var fileName = Path.GetFileName(imagePath);
             File.Copy(imagePath, Path.Combine(targetImageFolder, fileName), overwrite: true);
-            File.Copy(GetLabelPath(imagePath), Path.Combine(targetLabelFolder, Path.ChangeExtension(fileName, ".txt")), overwrite: true);
+            File.Copy(GetLabelPath(imagePath), Path.Combine(targetLabelFolder, labelFileName), overwrite: true);
         }
 
         File.WriteAllLines(Path.Combine(outputFolder, "labels.txt"), _labels, Encoding.UTF8);
         File.WriteAllText(Path.Combine(outputFolder, "dataset.yaml"), BuildDatasetYaml(outputFolder), Encoding.UTF8);
         File.WriteAllText(Path.Combine(outputFolder, "annotations.json"), JsonSerializer.Serialize(BuildManifestItems(), new JsonSerializerOptions { WriteIndented = true }), Encoding.UTF8);
         return labeledImages.Length;
+    }
+
+    private static void PrepareDatasetOutputFolder(String outputFolder)
+    {
+        Directory.CreateDirectory(outputFolder);
+
+        foreach (var childFolder in new[]
+                 {
+                     Path.Combine(outputFolder, "images"),
+                     Path.Combine(outputFolder, "labels")
+                 })
+        {
+            if (Directory.Exists(childFolder))
+                Directory.Delete(childFolder, recursive: true);
+        }
+
+        foreach (var filePath in new[]
+                 {
+                     Path.Combine(outputFolder, "dataset.yaml"),
+                     Path.Combine(outputFolder, "labels.txt"),
+                     Path.Combine(outputFolder, "annotations.json")
+                 })
+        {
+            if (File.Exists(filePath))
+                File.Delete(filePath);
+        }
     }
 
     private void ExportLabelBundle()
@@ -792,14 +861,17 @@ internal sealed class MainForm : Form
             if (modelDetections.Count > 0)
             {
                 _statusLabel.Text = $"已使用训练模型预标注：{Path.GetFileName(imagePath)}，候选数：{modelDetections.Count}";
+                _preAnnotationSourceLabel.Text = $"预标注来源：训练模型 {Path.GetFileName(modelPath)}";
                 return modelDetections;
             }
 
             _statusLabel.Text = $"模型未检测到候选，已回退启发式预标注：{Path.GetFileName(imagePath)}";
+            _preAnnotationSourceLabel.Text = "预标注来源：OpenCV 回退";
         }
         catch (Exception ex)
         {
             _statusLabel.Text = $"模型预标注失败，已回退启发式预标注：{ex.Message}";
+            _preAnnotationSourceLabel.Text = "预标注来源：OpenCV 回退";
         }
 
         return fallbackDetections;
@@ -821,6 +893,7 @@ internal sealed class MainForm : Form
 
         _modelPathTextBox.Text = dialog.FileName;
         _statusLabel.Text = $"已加载预标注模型：{Path.GetFileName(dialog.FileName)}";
+        _preAnnotationSourceLabel.Text = $"预标注来源：训练模型 {Path.GetFileName(dialog.FileName)}";
     }
 
     private Int32 ResolveClassId(String label)

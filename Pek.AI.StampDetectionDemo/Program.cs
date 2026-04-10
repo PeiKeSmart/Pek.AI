@@ -140,6 +140,21 @@ internal sealed class StampDetectionOptions
         if (!File.Exists(inputPath))
             throw new FileNotFoundException($"输入文件不存在: {inputPath}");
 
+        var inputDirectory = Path.GetDirectoryName(inputPath) ?? AppContext.BaseDirectory;
+        if (String.IsNullOrWhiteSpace(modelPath))
+        {
+            var autoModelPath = Path.Combine(inputDirectory, "model", "stamp-detector.onnx");
+            if (File.Exists(autoModelPath))
+                modelPath = autoModelPath;
+        }
+
+        if (String.IsNullOrWhiteSpace(labelsFilePath))
+        {
+            var autoLabelsPath = Path.Combine(inputDirectory, "model", "labels.txt");
+            if (File.Exists(autoLabelsPath))
+                labelsFilePath = autoLabelsPath;
+        }
+
         if (!String.IsNullOrWhiteSpace(modelPath) && !File.Exists(modelPath))
             throw new FileNotFoundException($"模型文件不存在: {modelPath}");
 
@@ -215,8 +230,14 @@ internal sealed class StampDetectionPipeline
             var finalDetections = onnxDetections.Count > 0 ? onnxDetections : openCvDetections;
             var annotatedPath = Path.Combine(_options.OutputDirectory, $"page_{page.PageNumber:000}.png");
             using var annotated = source.Clone();
-            DrawDetections(annotated, openCvDetections, Scalar.Orange, "CV");
-            DrawDetections(annotated, onnxDetections, Scalar.LimeGreen, "ONNX");
+            if (onnxDetections.Count > 0)
+            {
+                DrawDetections(annotated, finalDetections, Scalar.LimeGreen, "ONNX");
+            }
+            else
+            {
+                DrawDetections(annotated, openCvDetections, Scalar.Orange, "CV");
+            }
             Cv2.ImWrite(annotatedPath, annotated);
 
             results.Add(new StampPageResult(

@@ -1,0 +1,2 @@
+﻿seal
+partial-seal
