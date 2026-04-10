@@ -22,8 +22,12 @@ dotnet run --project .\Pek.AI.StampAnnotationTool\Pek.AI.StampAnnotationTool.csp
 2. 打开图片目录
 3. 设置类别列表，例如：`seal,partial-seal`
 4. 左键拖拽画框，右键点框删除
-5. 点击“保存当前”或“全部保存”
-6. 点击“导出 YOLO 数据集”生成训练目录
+5. 左键点击已有框可选中并拖动
+6. 数字键 `1-9` 切换当前类别，并会对选中框直接改类别
+7. 方向键微调选中框位置，`Shift + 方向键` 调整选中框大小
+8. `Delete` 删除最后一个框，`PageUp/PageDown` 切换图片，`Ctrl+S` 保存
+9. 点击“保存当前”或“全部保存”
+10. 点击“导出 YOLO 数据集”生成训练目录
 
 ## 与当前 ONNX Demo 的配合
 

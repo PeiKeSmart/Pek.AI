@@ -167,6 +167,15 @@ internal sealed class MainForm : Form
             return true;
         }
 
+        if (TryHandleClassHotkey(keyData))
+            return true;
+
+        if (TryHandleSelectedAnnotationHotkey(keyData))
+        {
+            RefreshImageListDisplay();
+            return true;
+        }
+
         if (keyData == Keys.PageDown)
         {
             Navigate(1);
@@ -180,6 +189,41 @@ internal sealed class MainForm : Form
         }
 
         return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    private Boolean TryHandleClassHotkey(Keys keyData)
+    {
+        var key = keyData & Keys.KeyCode;
+        if (key < Keys.D1 || key > Keys.D9)
+            return false;
+
+        var classIndex = (Int32)(key - Keys.D1);
+        if (classIndex < 0 || classIndex >= _classComboBox.Items.Count)
+            return false;
+
+        _classComboBox.SelectedIndex = classIndex;
+        _canvas.ApplyClassToSelection(classIndex);
+        RefreshImageListDisplay();
+        return true;
+    }
+
+    private Boolean TryHandleSelectedAnnotationHotkey(Keys keyData)
+    {
+        var step = keyData.HasFlag(Keys.Shift) ? 0.01f : 0.0025f;
+        var key = keyData & Keys.KeyCode;
+
+        return key switch
+        {
+            Keys.Left when keyData.HasFlag(Keys.Shift) => _canvas.ResizeSelected(-step, 0),
+            Keys.Right when keyData.HasFlag(Keys.Shift) => _canvas.ResizeSelected(step, 0),
+            Keys.Up when keyData.HasFlag(Keys.Shift) => _canvas.ResizeSelected(0, -step),
+            Keys.Down when keyData.HasFlag(Keys.Shift) => _canvas.ResizeSelected(0, step),
+            Keys.Left => _canvas.NudgeSelected(-step, 0),
+            Keys.Right => _canvas.NudgeSelected(step, 0),
+            Keys.Up => _canvas.NudgeSelected(0, -step),
+            Keys.Down => _canvas.NudgeSelected(0, step),
+            _ => false
+        };
     }
 
     private static Button CreateActionButton(String text, EventHandler handler)
@@ -580,8 +624,11 @@ internal sealed class AnnotationCanvas : Control
     private IReadOnlyList<String> _labels = [];
     private RectangleF _imageBounds;
     private Boolean _isDrawing;
+    private Boolean _isDraggingSelection;
     private Point _dragStart;
     private Point _dragEnd;
+    private Point _lastDragPoint;
+    private Int32 _selectedIndex = -1;
 
     public AnnotationCanvas()
     {
@@ -639,8 +686,45 @@ internal sealed class AnnotationCanvas : Control
             return;
 
         _annotations.RemoveAt(_annotations.Count - 1);
+        _selectedIndex = Math.Min(_selectedIndex, _annotations.Count - 1);
         AnnotationRemoved?.Invoke(this, EventArgs.Empty);
         Invalidate();
+    }
+
+    public Boolean ApplyClassToSelection(Int32 classId)
+    {
+        if (!HasValidSelection())
+            return false;
+
+        _annotations![_selectedIndex].ClassId = Math.Max(0, classId);
+        Invalidate();
+        return true;
+    }
+
+    public Boolean NudgeSelected(Single deltaX, Single deltaY)
+    {
+        if (!HasValidSelection())
+            return false;
+
+        var box = _annotations![_selectedIndex].NormalizedBox;
+        box.X = Math.Clamp(box.X + deltaX, 0f, 1f - box.Width);
+        box.Y = Math.Clamp(box.Y + deltaY, 0f, 1f - box.Height);
+        _annotations[_selectedIndex].NormalizedBox = box;
+        Invalidate();
+        return true;
+    }
+
+    public Boolean ResizeSelected(Single deltaWidth, Single deltaHeight)
+    {
+        if (!HasValidSelection())
+            return false;
+
+        var box = _annotations![_selectedIndex].NormalizedBox;
+        box.Width = Math.Clamp(box.Width + deltaWidth, 0.005f, 1f - box.X);
+        box.Height = Math.Clamp(box.Height + deltaHeight, 0.005f, 1f - box.Y);
+        _annotations[_selectedIndex].NormalizedBox = box;
+        Invalidate();
+        return true;
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -664,9 +748,9 @@ internal sealed class AnnotationCanvas : Control
 
         if (_annotations != null)
         {
-            foreach (var annotation in _annotations)
+            for (var index = 0; index < _annotations.Count; index++)
             {
-                DrawAnnotation(e.Graphics, annotation, highlight: false);
+                DrawAnnotation(e.Graphics, _annotations[index], highlight: index == _selectedIndex);
             }
         }
 
@@ -687,12 +771,29 @@ internal sealed class AnnotationCanvas : Control
         if (e.Button == MouseButtons.Left)
         {
             if (!_imageBounds.Contains(e.Location))
+            {
+                _selectedIndex = -1;
+                Invalidate();
                 return;
+            }
+
+            var selectedIndex = HitTestAnnotation(e.Location);
+            if (selectedIndex >= 0)
+            {
+                _selectedIndex = selectedIndex;
+                _isDraggingSelection = true;
+                _lastDragPoint = e.Location;
+                Capture = true;
+                Invalidate();
+                return;
+            }
 
             _isDrawing = true;
+            _selectedIndex = -1;
             _dragStart = e.Location;
             _dragEnd = e.Location;
             Capture = true;
+            Invalidate();
         }
         else if (e.Button == MouseButtons.Right)
         {
@@ -703,6 +804,12 @@ internal sealed class AnnotationCanvas : Control
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
+        if (_isDraggingSelection)
+        {
+            DragSelectedAnnotation(e.Location);
+            return;
+        }
+
         if (!_isDrawing)
             return;
 
@@ -713,6 +820,13 @@ internal sealed class AnnotationCanvas : Control
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
+        if (_isDraggingSelection)
+        {
+            _isDraggingSelection = false;
+            Capture = false;
+            return;
+        }
+
         if (!_isDrawing || _currentBitmap == null || _annotations == null)
             return;
 
@@ -739,7 +853,26 @@ internal sealed class AnnotationCanvas : Control
             ClassId = Math.Max(0, ActiveClassId),
             NormalizedBox = normalized
         });
+        _selectedIndex = _annotations.Count - 1;
         AnnotationCreated?.Invoke(this, EventArgs.Empty);
+        Invalidate();
+    }
+
+    private void DragSelectedAnnotation(Point point)
+    {
+        if (!HasValidSelection())
+            return;
+
+        var deltaX = (point.X - _lastDragPoint.X) / Math.Max(1f, _imageBounds.Width);
+        var deltaY = (point.Y - _lastDragPoint.Y) / Math.Max(1f, _imageBounds.Height);
+        if (Math.Abs(deltaX) < Single.Epsilon && Math.Abs(deltaY) < Single.Epsilon)
+            return;
+
+        var box = _annotations![_selectedIndex].NormalizedBox;
+        box.X = Math.Clamp(box.X + deltaX, 0f, 1f - box.Width);
+        box.Y = Math.Clamp(box.Y + deltaY, 0f, 1f - box.Height);
+        _annotations[_selectedIndex].NormalizedBox = box;
+        _lastDragPoint = point;
         Invalidate();
     }
 
@@ -755,11 +888,31 @@ internal sealed class AnnotationCanvas : Control
                 continue;
 
             _annotations.RemoveAt(index);
+            _selectedIndex = _annotations.Count == 0 ? -1 : Math.Min(_selectedIndex, _annotations.Count - 1);
             AnnotationRemoved?.Invoke(this, EventArgs.Empty);
             Invalidate();
             return;
         }
+
+        _selectedIndex = -1;
+        Invalidate();
     }
+
+    private Int32 HitTestAnnotation(Point point)
+    {
+        if (_annotations == null)
+            return -1;
+
+        for (var index = _annotations.Count - 1; index >= 0; index--)
+        {
+            if (ConvertNormalizedToDisplay(_annotations[index].NormalizedBox).Contains(point))
+                return index;
+        }
+
+        return -1;
+    }
+
+    private Boolean HasValidSelection() => _annotations != null && _selectedIndex >= 0 && _selectedIndex < _annotations.Count;
 
     private void DrawAnnotation(Graphics graphics, AnnotationBox annotation, Boolean highlight)
     {
