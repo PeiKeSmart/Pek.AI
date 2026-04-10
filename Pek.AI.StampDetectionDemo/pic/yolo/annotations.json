@@ -1,0 +1,47 @@
+﻿[
+  {
+    "ImageFile": "sample-nonred-partial.png",
+    "AnnotationFile": "labels/sample-nonred-partial.txt",
+    "Count": 0
+  },
+  {
+    "ImageFile": "sample-stamps.png",
+    "AnnotationFile": "labels/sample-stamps.txt",
+    "Count": 0
+  },
+  {
+    "ImageFile": "seal-count-1.png",
+    "AnnotationFile": "labels/seal-count-1.txt",
+    "Count": 0
+  },
+  {
+    "ImageFile": "seal-count-2.png",
+    "AnnotationFile": "labels/seal-count-2.txt",
+    "Count": 0
+  },
+  {
+    "ImageFile": "seal-count-3.png",
+    "AnnotationFile": "labels/seal-count-3.txt",
+    "Count": 0
+  },
+  {
+    "ImageFile": "strict-1-full.png",
+    "AnnotationFile": "labels/strict-1-full.txt",
+    "Count": 0
+  },
+  {
+    "ImageFile": "strict-1-half-one-stamp.png",
+    "AnnotationFile": "labels/strict-1-half-one-stamp.txt",
+    "Count": 0
+  },
+  {
+    "ImageFile": "strict-2-full.png",
+    "AnnotationFile": "labels/strict-2-full.txt",
+    "Count": 0
+  },
+  {
+    "ImageFile": "strict-2-half-two-stamps.png",
+    "AnnotationFile": "labels/strict-2-half-two-stamps.txt",
+    "Count": 2
+  }
+]

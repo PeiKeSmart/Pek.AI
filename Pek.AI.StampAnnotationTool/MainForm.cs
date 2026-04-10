@@ -4,6 +4,8 @@ using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Windows.Forms;
+using Microsoft.ML.OnnxRuntime;
+using Microsoft.ML.OnnxRuntime.Tensors;
 using Cv2 = OpenCvSharp.Cv2;
 using CvAdaptiveThresholdTypes = OpenCvSharp.AdaptiveThresholdTypes;
 using CvColorConversionCodes = OpenCvSharp.ColorConversionCodes;
@@ -29,6 +31,7 @@ internal sealed class MainForm : Form
     private readonly AnnotationCanvas _canvas;
     private readonly ComboBox _classComboBox;
     private readonly CheckBox _autoSaveCheckBox;
+    private readonly TextBox _modelPathTextBox;
     private readonly TextBox _labelsTextBox;
     private readonly Label _statusLabel;
     private readonly StampPreAnnotationDetector _preAnnotationDetector = new();
@@ -39,6 +42,7 @@ internal sealed class MainForm : Form
     private Bitmap? _currentBitmap;
     private String? _currentImagePath;
     private List<String> _labels = ["seal", "partial-seal"];
+    private Boolean _suppressImageSelectionChanged;
 
     public MainForm()
     {
@@ -51,7 +55,8 @@ internal sealed class MainForm : Form
         var mainSplit = new SplitContainer
         {
             Dock = DockStyle.Fill,
-            SplitterDistance = 340,
+            SplitterDistance = 430,
+            Panel1MinSize = 420,
             FixedPanel = FixedPanel.Panel1
         };
         Controls.Add(mainSplit);
@@ -70,7 +75,7 @@ internal sealed class MainForm : Form
         leftLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         mainSplit.Panel1.Controls.Add(leftLayout);
 
-        var openButton = new Button { Text = "打开图片目录", Dock = DockStyle.Top, Height = 38 };
+        var openButton = new Button { Text = "打开图片目录", Dock = DockStyle.Top, Height = 38, AutoSize = false, Width = 180 };
         openButton.Click += (_, _) => OpenImageFolder();
         leftLayout.Controls.Add(openButton, 0, 0);
 
@@ -85,14 +90,29 @@ internal sealed class MainForm : Form
         labelsPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         labelsPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         labelsPanel.Controls.Add(new Label { Text = "类别列表，逗号分隔，顺序会写入 YOLO 和 ONNX 标签清单", AutoSize = true }, 0, 0);
-        _labelsTextBox = new TextBox { Text = String.Join(',', _labels), Dock = DockStyle.Top };
+        _labelsTextBox = new TextBox { Text = String.Join(',', _labels), Dock = DockStyle.Top, Width = 380 };
         labelsPanel.Controls.Add(_labelsTextBox, 0, 1);
-        var applyLabelsButton = new Button { Text = "应用类别", Dock = DockStyle.Top, Height = 32 };
+        var applyLabelsButton = new Button { Text = "应用类别", Dock = DockStyle.Top, Height = 32, AutoSize = false, Width = 180 };
         applyLabelsButton.Click += (_, _) => ApplyLabels();
         labelsPanel.Controls.Add(applyLabelsButton, 0, 2);
+        var modelPanel = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            FlowDirection = FlowDirection.LeftToRight,
+            AutoSize = true,
+            WrapContents = false,
+            Margin = new Padding(0, 8, 0, 0)
+        };
+        modelPanel.Controls.Add(new Label { Text = "预标注模型", AutoSize = true, Margin = new Padding(0, 8, 4, 0) });
+        _modelPathTextBox = new TextBox { Width = 180 };
+        modelPanel.Controls.Add(_modelPathTextBox);
+        var browseModelButton = new Button { Text = "选择模型", AutoSize = true, Height = 30 };
+        browseModelButton.Click += (_, _) => SelectOnnxModel();
+        modelPanel.Controls.Add(browseModelButton);
+        labelsPanel.Controls.Add(modelPanel, 0, 3);
         leftLayout.Controls.Add(labelsPanel, 0, 1);
 
-        _imageListBox = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false };
+        _imageListBox = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false, HorizontalScrollbar = true };
         _imageListBox.SelectedIndexChanged += (_, _) => OnSelectedImageChanged();
         leftLayout.Controls.Add(_imageListBox, 0, 2);
 
@@ -149,7 +169,7 @@ internal sealed class MainForm : Form
             WrapContents = true
         };
         toolPanel.Controls.Add(new Label { Text = "当前类别", AutoSize = true, Margin = new Padding(0, 10, 4, 0) });
-        _classComboBox = new ComboBox { Width = 220, DropDownStyle = ComboBoxStyle.DropDownList };
+        _classComboBox = new ComboBox { Width = 260, DropDownStyle = ComboBoxStyle.DropDownList };
         toolPanel.Controls.Add(_classComboBox);
         toolPanel.Controls.Add(new Label { Text = "操作：左键拖拽画框，右键点框删除，Ctrl+S 保存，Delete 删除最后一个框", AutoSize = true, Margin = new Padding(18, 10, 0, 0) });
         rightLayout.Controls.Add(toolPanel, 0, 0);
@@ -250,7 +270,7 @@ internal sealed class MainForm : Form
 
     private static Button CreateActionButton(String text, EventHandler handler)
     {
-        var button = new Button { Text = text, AutoSize = true, Height = 34, Padding = new Padding(8, 4, 8, 4) };
+        var button = new Button { Text = text, AutoSize = false, Width = 132, Height = 34, Padding = new Padding(8, 4, 8, 4) };
         button.Click += handler;
         return button;
     }
@@ -275,6 +295,7 @@ internal sealed class MainForm : Form
         _currentFolder = folderPath;
         _imageFiles.Clear();
         _documents.Clear();
+        _suppressImageSelectionChanged = true;
         _imageListBox.Items.Clear();
 
         var images = Directory.EnumerateFiles(folderPath)
@@ -301,6 +322,10 @@ internal sealed class MainForm : Form
             ClearCurrentImage();
             _statusLabel.Text = "当前目录没有可标注图片。";
         }
+
+        _suppressImageSelectionChanged = false;
+        if (_imageFiles.Count > 0)
+            LoadSelectedImage();
     }
 
     private void ReloadLabelsFromFolder()
@@ -385,6 +410,9 @@ internal sealed class MainForm : Form
 
     private void OnSelectedImageChanged()
     {
+        if (_suppressImageSelectionChanged)
+            return;
+
         if (_autoSaveCheckBox.Checked)
             SaveCurrentAnnotations();
 
@@ -651,6 +679,7 @@ internal sealed class MainForm : Form
     private Int32 ApplyAutoAnnotations(String imagePath, AnnotationDocument document, Boolean overwrite)
     {
         var detections = _preAnnotationDetector.Detect(imagePath);
+        detections = DetectWithPreferredPreAnnotation(imagePath, detections);
         if (overwrite)
             document.Annotations.Clear();
 
@@ -670,6 +699,50 @@ internal sealed class MainForm : Form
         }
 
         return detections.Count;
+    }
+
+    private IReadOnlyList<DetectedAnnotation> DetectWithPreferredPreAnnotation(String imagePath, IReadOnlyList<DetectedAnnotation> fallbackDetections)
+    {
+        var modelPath = _modelPathTextBox.Text.Trim();
+        if (String.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath))
+            return fallbackDetections;
+
+        try
+        {
+            using var detector = new OnnxPreAnnotationDetector(modelPath, _labels);
+            var modelDetections = detector.Detect(imagePath);
+            if (modelDetections.Count > 0)
+            {
+                _statusLabel.Text = $"已使用训练模型预标注：{Path.GetFileName(imagePath)}，候选数：{modelDetections.Count}";
+                return modelDetections;
+            }
+
+            _statusLabel.Text = $"模型未检测到候选，已回退启发式预标注：{Path.GetFileName(imagePath)}";
+        }
+        catch (Exception ex)
+        {
+            _statusLabel.Text = $"模型预标注失败，已回退启发式预标注：{ex.Message}";
+        }
+
+        return fallbackDetections;
+    }
+
+    private void SelectOnnxModel()
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Title = "选择 ONNX 预标注模型",
+            Filter = "ONNX 模型 (*.onnx)|*.onnx|所有文件 (*.*)|*.*",
+            CheckFileExists = true,
+            Multiselect = false,
+            InitialDirectory = !String.IsNullOrWhiteSpace(_currentFolder) ? _currentFolder : AppContext.BaseDirectory
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+            return;
+
+        _modelPathTextBox.Text = dialog.FileName;
+        _statusLabel.Text = $"已加载预标注模型：{Path.GetFileName(dialog.FileName)}";
     }
 
     private Int32 ResolveClassId(String label)
@@ -751,6 +824,7 @@ internal sealed class MainForm : Form
     private void RefreshImageListDisplay()
     {
         var selectedIndex = _imageListBox.SelectedIndex;
+        _suppressImageSelectionChanged = true;
         _imageListBox.BeginUpdate();
         _imageListBox.Items.Clear();
         foreach (var imagePath in _imageFiles)
@@ -761,6 +835,8 @@ internal sealed class MainForm : Form
 
         if (selectedIndex >= 0 && selectedIndex < _imageListBox.Items.Count)
             _imageListBox.SelectedIndex = selectedIndex;
+
+        _suppressImageSelectionChanged = false;
 
         if (!String.IsNullOrWhiteSpace(_currentImagePath))
             _statusLabel.Text = $"当前图片：{Path.GetFileName(_currentImagePath)}，标注数：{_documents[_currentImagePath].Annotations.Count}";
@@ -1592,3 +1668,162 @@ internal sealed class StampPreAnnotationDetector
 }
 
 internal sealed record DetectedAnnotation(RectangleF NormalizedBox, Single Score, String Label);
+
+internal sealed class OnnxPreAnnotationDetector : IDisposable
+{
+    private readonly InferenceSession _session;
+    private readonly IReadOnlyList<String> _labels;
+    private readonly String _inputName;
+    private readonly Int32 _inputSize;
+    private readonly Single _confidenceThreshold;
+    private readonly Single _iouThreshold;
+
+    public OnnxPreAnnotationDetector(String modelPath, IReadOnlyList<String> labels, Int32 inputSize = 640, Single confidenceThreshold = 0.25f, Single iouThreshold = 0.45f)
+    {
+        _session = new InferenceSession(modelPath);
+        _labels = labels;
+        _inputName = _session.InputMetadata.Keys.First();
+        _inputSize = inputSize;
+        _confidenceThreshold = confidenceThreshold;
+        _iouThreshold = iouThreshold;
+    }
+
+    public IReadOnlyList<DetectedAnnotation> Detect(String imagePath)
+    {
+        using var source = Cv2.ImRead(imagePath, CvImreadModes.Color);
+        if (source.Empty())
+            return [];
+
+        var (tensor, ratio, padX, padY) = Letterbox(source, _inputSize);
+        var input = NamedOnnxValue.CreateFromTensor(_inputName, tensor);
+        using var results = _session.Run([input]);
+        var output = results.First().AsTensor<Single>();
+        var detections = Decode(output, ratio, padX, padY, source.Width, source.Height, _labels, _confidenceThreshold);
+        return ApplyNms(detections, _iouThreshold);
+    }
+
+    public void Dispose()
+    {
+        _session.Dispose();
+    }
+
+    private static (DenseTensor<Single> Tensor, Single Ratio, Int32 PadX, Int32 PadY) Letterbox(CvMat source, Int32 inputSize)
+    {
+        var ratio = Math.Min(inputSize / (Single)source.Width, inputSize / (Single)source.Height);
+        var resizedWidth = Math.Max(1, (Int32)Math.Round(source.Width * ratio));
+        var resizedHeight = Math.Max(1, (Int32)Math.Round(source.Height * ratio));
+        var padX = (inputSize - resizedWidth) / 2;
+        var padY = (inputSize - resizedHeight) / 2;
+
+        using var resized = new CvMat();
+        using var letterbox = new CvMat(new CvSize(inputSize, inputSize), CvMatType.CV_8UC3, new CvScalar(114, 114, 114));
+        Cv2.Resize(source, resized, new CvSize(resizedWidth, resizedHeight));
+        resized.CopyTo(new CvMat(letterbox, new CvRect(padX, padY, resizedWidth, resizedHeight)));
+
+        var tensor = new DenseTensor<Single>([1, 3, inputSize, inputSize]);
+        for (var y = 0; y < inputSize; y++)
+        {
+            for (var x = 0; x < inputSize; x++)
+            {
+                var pixel = letterbox.At<OpenCvSharp.Vec3b>(y, x);
+                tensor[0, 0, y, x] = pixel.Item2 / 255f;
+                tensor[0, 1, y, x] = pixel.Item1 / 255f;
+                tensor[0, 2, y, x] = pixel.Item0 / 255f;
+            }
+        }
+
+        return (tensor, ratio, padX, padY);
+    }
+
+    private static List<DetectedAnnotation> Decode(Tensor<Single> output, Single ratio, Int32 padX, Int32 padY, Int32 originalWidth, Int32 originalHeight, IReadOnlyList<String> labels, Single confidenceThreshold)
+    {
+        var dimensions = output.Dimensions.ToArray();
+        if (dimensions.Length != 3)
+            throw new NotSupportedException($"当前预标注仅支持三维 YOLO 输出，实际输出维度为 {dimensions.Length}");
+
+        var detections = new List<DetectedAnnotation>();
+        if (dimensions[1] >= 6 && dimensions[2] > dimensions[1])
+        {
+            var featureCount = dimensions[1];
+            var boxCount = dimensions[2];
+            for (var index = 0; index < boxCount; index++)
+            {
+                AppendDetection(output, labels, confidenceThreshold, detections, output[0, 0, index], output[0, 1, index], output[0, 2, index], output[0, 3, index], featureCount, index, ratio, padX, padY, originalWidth, originalHeight);
+            }
+        }
+        else
+        {
+            var boxCount = dimensions[1];
+            var featureCount = dimensions[2];
+            for (var index = 0; index < boxCount; index++)
+            {
+                AppendDetection(output, labels, confidenceThreshold, detections, output[0, index, 0], output[0, index, 1], output[0, index, 2], output[0, index, 3], featureCount, index, ratio, padX, padY, originalWidth, originalHeight, channelLast: true);
+            }
+        }
+
+        return detections;
+    }
+
+    private static void AppendDetection(Tensor<Single> output, IReadOnlyList<String> labels, Single confidenceThreshold, List<DetectedAnnotation> detections, Single centerX, Single centerY, Single width, Single height, Int32 featureCount, Int32 index, Single ratio, Int32 padX, Int32 padY, Int32 originalWidth, Int32 originalHeight, Boolean channelLast = false)
+    {
+        var bestClass = 0;
+        var bestScore = 0f;
+        for (var classIndex = 4; classIndex < featureCount; classIndex++)
+        {
+            var score = channelLast ? output[0, index, classIndex] : output[0, classIndex, index];
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestClass = classIndex - 4;
+            }
+        }
+
+        if (bestScore < confidenceThreshold)
+            return;
+
+        var x1 = (centerX - width / 2 - padX) / ratio;
+        var y1 = (centerY - height / 2 - padY) / ratio;
+        var x2 = (centerX + width / 2 - padX) / ratio;
+        var y2 = (centerY + height / 2 - padY) / ratio;
+        var left = Math.Clamp((Single)(x1 / Math.Max(1, originalWidth)), 0f, 1f);
+        var top = Math.Clamp((Single)(y1 / Math.Max(1, originalHeight)), 0f, 1f);
+        var right = Math.Clamp((Single)(x2 / Math.Max(1, originalWidth)), left + 0.001f, 1f);
+        var bottom = Math.Clamp((Single)(y2 / Math.Max(1, originalHeight)), top + 0.001f, 1f);
+        var label = bestClass < labels.Count ? labels[bestClass] : $"class_{bestClass}";
+        detections.Add(new DetectedAnnotation(RectangleF.FromLTRB(left, top, right, bottom), bestScore, label));
+    }
+
+    private static IReadOnlyList<DetectedAnnotation> ApplyNms(IReadOnlyList<DetectedAnnotation> detections, Single iouThreshold)
+    {
+        if (detections.Count <= 1)
+            return detections;
+
+        var ordered = detections.OrderByDescending(item => item.Score).ToList();
+        var kept = new List<DetectedAnnotation>();
+        while (ordered.Count > 0)
+        {
+            var current = ordered[0];
+            kept.Add(current);
+            ordered.RemoveAt(0);
+            ordered.RemoveAll(candidate => ComputeIou(current.NormalizedBox, candidate.NormalizedBox) >= iouThreshold);
+        }
+
+        return kept;
+    }
+
+    private static Single ComputeIou(RectangleF first, RectangleF second)
+    {
+        var x1 = Math.Max(first.Left, second.Left);
+        var y1 = Math.Max(first.Top, second.Top);
+        var x2 = Math.Min(first.Right, second.Right);
+        var y2 = Math.Min(first.Bottom, second.Bottom);
+        var intersectionWidth = Math.Max(0, x2 - x1);
+        var intersectionHeight = Math.Max(0, y2 - y1);
+        var intersection = intersectionWidth * intersectionHeight;
+        if (intersection <= 0)
+            return 0;
+
+        var union = first.Width * first.Height + second.Width * second.Height - intersection;
+        return union <= 0 ? 0 : intersection / union;
+    }
+}
