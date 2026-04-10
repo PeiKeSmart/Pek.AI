@@ -711,12 +711,15 @@ internal sealed class MainForm : Form
 
 internal sealed class AnnotationCanvas : Control
 {
+    private const Single ResizeHandleSize = 10f;
+
     private Bitmap? _currentBitmap;
     private List<AnnotationBox>? _annotations;
     private IReadOnlyList<String> _labels = [];
     private RectangleF _imageBounds;
     private Boolean _isDrawing;
     private Boolean _isDraggingSelection;
+    private Boolean _isResizingSelection;
     private Boolean _isPanning;
     private Point _dragStart;
     private Point _dragEnd;
@@ -725,6 +728,7 @@ internal sealed class AnnotationCanvas : Control
     private Int32 _selectedIndex = -1;
     private Single _zoom = 1f;
     private PointF _panOffset = PointF.Empty;
+    private ResizeHandle _activeResizeHandle = ResizeHandle.None;
 
     public AnnotationCanvas()
     {
@@ -893,6 +897,15 @@ internal sealed class AnnotationCanvas : Control
             if (selectedIndex >= 0)
             {
                 _selectedIndex = selectedIndex;
+                _activeResizeHandle = HitTestResizeHandle(e.Location, _annotations[selectedIndex].NormalizedBox);
+                if (_activeResizeHandle != ResizeHandle.None)
+                {
+                    _isResizingSelection = true;
+                    Capture = true;
+                    Invalidate();
+                    return;
+                }
+
                 _isDraggingSelection = true;
                 _lastDragPoint = e.Location;
                 Capture = true;
@@ -930,6 +943,12 @@ internal sealed class AnnotationCanvas : Control
             return;
         }
 
+        if (_isResizingSelection)
+        {
+            ResizeSelectedAnnotation(e.Location);
+            return;
+        }
+
         if (!_isDrawing)
             return;
 
@@ -951,6 +970,14 @@ internal sealed class AnnotationCanvas : Control
         if (_isDraggingSelection)
         {
             _isDraggingSelection = false;
+            Capture = false;
+            return;
+        }
+
+        if (_isResizingSelection)
+        {
+            _isResizingSelection = false;
+            _activeResizeHandle = ResizeHandle.None;
             Capture = false;
             return;
         }
@@ -1028,6 +1055,48 @@ internal sealed class AnnotationCanvas : Control
         Invalidate();
     }
 
+    private void ResizeSelectedAnnotation(Point point)
+    {
+        if (!HasValidSelection() || _activeResizeHandle == ResizeHandle.None)
+            return;
+
+        var current = _annotations![_selectedIndex].NormalizedBox;
+        var left = current.Left;
+        var top = current.Top;
+        var right = current.Right;
+        var bottom = current.Bottom;
+        var normalizedPoint = ConvertDisplayPointToNormalized(point);
+
+        switch (_activeResizeHandle)
+        {
+            case ResizeHandle.TopLeft:
+                left = normalizedPoint.X;
+                top = normalizedPoint.Y;
+                break;
+            case ResizeHandle.TopRight:
+                right = normalizedPoint.X;
+                top = normalizedPoint.Y;
+                break;
+            case ResizeHandle.BottomLeft:
+                left = normalizedPoint.X;
+                bottom = normalizedPoint.Y;
+                break;
+            case ResizeHandle.BottomRight:
+                right = normalizedPoint.X;
+                bottom = normalizedPoint.Y;
+                break;
+        }
+
+        const Single minSize = 0.005f;
+        left = Math.Clamp(left, 0f, Math.Max(0f, right - minSize));
+        top = Math.Clamp(top, 0f, Math.Max(0f, bottom - minSize));
+        right = Math.Clamp(right, Math.Min(1f, left + minSize), 1f);
+        bottom = Math.Clamp(bottom, Math.Min(1f, top + minSize), 1f);
+
+        _annotations[_selectedIndex].NormalizedBox = RectangleF.FromLTRB(left, top, right, bottom);
+        Invalidate();
+    }
+
     private void RemoveAnnotationAt(Point point)
     {
         if (_annotations == null)
@@ -1066,6 +1135,18 @@ internal sealed class AnnotationCanvas : Control
 
     private Boolean HasValidSelection() => _annotations != null && _selectedIndex >= 0 && _selectedIndex < _annotations.Count;
 
+    private ResizeHandle HitTestResizeHandle(Point point, RectangleF normalizedBox)
+    {
+        var rect = ConvertNormalizedToDisplay(normalizedBox);
+        foreach (var handle in GetResizeHandles(rect))
+        {
+            if (handle.Bounds.Contains(point))
+                return handle.Handle;
+        }
+
+        return ResizeHandle.None;
+    }
+
     private void DrawAnnotation(Graphics graphics, AnnotationBox annotation, Boolean highlight)
     {
         var rect = ConvertNormalizedToDisplay(annotation.NormalizedBox);
@@ -1081,6 +1162,17 @@ internal sealed class AnnotationCanvas : Control
         var textRect = new RectangleF(rect.X, Math.Max(_imageBounds.Top, rect.Y - textSize.Height), textSize.Width + 10, textSize.Height + 4);
         graphics.FillRectangle(backgroundBrush, textRect);
         graphics.DrawString(label, font, textBrush, textRect.X + 5, textRect.Y + 2);
+
+        if (highlight)
+        {
+            using var handleBrush = new SolidBrush(Color.White);
+            using var handlePen = new Pen(color, 1.5f);
+            foreach (var handle in GetResizeHandles(rect))
+            {
+                graphics.FillRectangle(handleBrush, handle.Bounds);
+                graphics.DrawRectangle(handlePen, handle.Bounds.X, handle.Bounds.Y, handle.Bounds.Width, handle.Bounds.Height);
+            }
+        }
     }
 
     private RectangleF ConvertNormalizedToDisplay(RectangleF normalized)
@@ -1099,6 +1191,13 @@ internal sealed class AnnotationCanvas : Control
         var right = Math.Clamp((display.Right - _imageBounds.Left) / _imageBounds.Width, 0f, 1f);
         var bottom = Math.Clamp((display.Bottom - _imageBounds.Top) / _imageBounds.Height, 0f, 1f);
         return RectangleF.FromLTRB(left, top, right, bottom);
+    }
+
+    private PointF ConvertDisplayPointToNormalized(Point point)
+    {
+        var x = Math.Clamp((point.X - _imageBounds.Left) / _imageBounds.Width, 0f, 1f);
+        var y = Math.Clamp((point.Y - _imageBounds.Top) / _imageBounds.Height, 0f, 1f);
+        return new PointF(x, y);
     }
 
     private static RectangleF NormalizeDisplayRectangle(Point first, Point second)
@@ -1128,7 +1227,27 @@ internal sealed class AnnotationCanvas : Control
         Color[] palette = [Color.Orange, Color.LimeGreen, Color.DeepSkyBlue, Color.HotPink, Color.Gold, Color.Cyan];
         return palette[Math.Abs(classId) % palette.Length];
     }
+
+    private static IEnumerable<ResizeHandleInfo> GetResizeHandles(RectangleF rect)
+    {
+        var half = ResizeHandleSize / 2f;
+        yield return new ResizeHandleInfo(ResizeHandle.TopLeft, new RectangleF(rect.Left - half, rect.Top - half, ResizeHandleSize, ResizeHandleSize));
+        yield return new ResizeHandleInfo(ResizeHandle.TopRight, new RectangleF(rect.Right - half, rect.Top - half, ResizeHandleSize, ResizeHandleSize));
+        yield return new ResizeHandleInfo(ResizeHandle.BottomLeft, new RectangleF(rect.Left - half, rect.Bottom - half, ResizeHandleSize, ResizeHandleSize));
+        yield return new ResizeHandleInfo(ResizeHandle.BottomRight, new RectangleF(rect.Right - half, rect.Bottom - half, ResizeHandleSize, ResizeHandleSize));
+    }
 }
+
+internal enum ResizeHandle
+{
+    None,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight
+}
+
+internal readonly record struct ResizeHandleInfo(ResizeHandle Handle, RectangleF Bounds);
 
 internal sealed class AnnotationDocument
 {
