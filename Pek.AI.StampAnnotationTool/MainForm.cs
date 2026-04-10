@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Globalization;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Windows.Forms;
@@ -31,8 +32,14 @@ internal sealed class MainForm : Form
     private readonly AnnotationCanvas _canvas;
     private readonly ComboBox _classComboBox;
     private readonly CheckBox _autoSaveCheckBox;
+    private readonly CheckBox _openOnnxAfterTrainCheckBox;
     private readonly TextBox _modelPathTextBox;
     private readonly TextBox _labelsTextBox;
+    private readonly TextBox _trainBaseModelTextBox;
+    private readonly TextBox _trainEpochsTextBox;
+    private readonly TextBox _trainBatchTextBox;
+    private readonly TextBox _trainImageSizeTextBox;
+    private readonly TextBox _trainDeviceTextBox;
     private readonly Label _statusLabel;
     private readonly StampPreAnnotationDetector _preAnnotationDetector = new();
     private readonly Dictionary<String, AnnotationDocument> _documents = new(StringComparer.OrdinalIgnoreCase);
@@ -43,6 +50,7 @@ internal sealed class MainForm : Form
     private String? _currentImagePath;
     private List<String> _labels = ["seal", "partial-seal"];
     private Boolean _suppressImageSelectionChanged;
+    private Boolean _isTraining;
 
     public MainForm()
     {
@@ -65,12 +73,13 @@ internal sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 5,
+            RowCount = 6,
             Padding = new Padding(8)
         };
         leftLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         leftLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         leftLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        leftLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         leftLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         leftLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         mainSplit.Panel1.Controls.Add(leftLayout);
@@ -147,6 +156,50 @@ internal sealed class MainForm : Form
         exportPanel.Controls.Add(CreateActionButton("重置视图", (_, _) => ResetCanvasView()));
         exportPanel.Controls.Add(CreateActionButton("重新加载标签", (_, _) => ReloadLabelsFromFolder()));
         leftLayout.Controls.Add(exportPanel, 0, 4);
+
+        var trainGroup = new GroupBox
+        {
+            Text = "训练并导出模型",
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            Padding = new Padding(10)
+        };
+        var trainLayout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            ColumnCount = 2,
+            RowCount = 6,
+            AutoSize = true
+        };
+        trainLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        trainLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        trainLayout.Controls.Add(new Label { Text = "基础模型", AutoSize = true, Margin = new Padding(0, 8, 8, 0) }, 0, 0);
+        _trainBaseModelTextBox = new TextBox { Text = "yolov8n.pt", Dock = DockStyle.Top, Width = 240 };
+        trainLayout.Controls.Add(_trainBaseModelTextBox, 1, 0);
+        trainLayout.Controls.Add(new Label { Text = "Epochs/Batch", AutoSize = true, Margin = new Padding(0, 8, 8, 0) }, 0, 1);
+        var epochsBatchPanel = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Dock = DockStyle.Top };
+        _trainEpochsTextBox = new TextBox { Text = "100", Width = 70 };
+        _trainBatchTextBox = new TextBox { Text = "16", Width = 70 };
+        epochsBatchPanel.Controls.Add(_trainEpochsTextBox);
+        epochsBatchPanel.Controls.Add(new Label { Text = "/", AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        epochsBatchPanel.Controls.Add(_trainBatchTextBox);
+        trainLayout.Controls.Add(epochsBatchPanel, 1, 1);
+        trainLayout.Controls.Add(new Label { Text = "图像尺寸/设备", AutoSize = true, Margin = new Padding(0, 8, 8, 0) }, 0, 2);
+        var imageDevicePanel = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Dock = DockStyle.Top };
+        _trainImageSizeTextBox = new TextBox { Text = "640", Width = 70 };
+        _trainDeviceTextBox = new TextBox { Text = "cpu", Width = 90 };
+        imageDevicePanel.Controls.Add(_trainImageSizeTextBox);
+        imageDevicePanel.Controls.Add(new Label { Text = "/", AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        imageDevicePanel.Controls.Add(_trainDeviceTextBox);
+        trainLayout.Controls.Add(imageDevicePanel, 1, 2);
+        _openOnnxAfterTrainCheckBox = new CheckBox { Text = "训练完成后自动填入 best.onnx", AutoSize = true, Checked = true, Margin = new Padding(0, 8, 0, 0) };
+        trainLayout.Controls.Add(_openOnnxAfterTrainCheckBox, 1, 3);
+        var trainButton = new Button { Text = "训练并导出 ONNX", AutoSize = false, Width = 180, Height = 34, Margin = new Padding(0, 8, 0, 0) };
+        trainButton.Click += async (_, _) => await TrainAndExportOnnxAsync();
+        trainLayout.Controls.Add(trainButton, 1, 4);
+        trainLayout.Controls.Add(new Label { Text = "说明：会先导出当前目录下的 yolo 数据集，再调用仓库内 train_yolo.py 训练并导出 ONNX。", AutoSize = true, Margin = new Padding(0, 8, 0, 0) }, 1, 5);
+        trainGroup.Controls.Add(trainLayout);
+        leftLayout.Controls.Add(trainGroup, 0, 5);
 
         var rightLayout = new TableLayoutPanel
         {
@@ -557,6 +610,14 @@ internal sealed class MainForm : Form
             return;
 
         var outputFolder = dialog.SelectedPath;
+        var labeledCount = ExportDatasetToFolder(outputFolder);
+
+        _statusLabel.Text = $"已导出数据集：{outputFolder}";
+        MessageBox.Show(this, $"已导出 {labeledCount} 张已标注图片。", "导出完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private Int32 ExportDatasetToFolder(String outputFolder)
+    {
         Directory.CreateDirectory(outputFolder);
 
         var trainImageFolder = Path.Combine(outputFolder, "images", "train");
@@ -587,9 +648,7 @@ internal sealed class MainForm : Form
         File.WriteAllLines(Path.Combine(outputFolder, "labels.txt"), _labels, Encoding.UTF8);
         File.WriteAllText(Path.Combine(outputFolder, "dataset.yaml"), BuildDatasetYaml(outputFolder), Encoding.UTF8);
         File.WriteAllText(Path.Combine(outputFolder, "annotations.json"), JsonSerializer.Serialize(BuildManifestItems(), new JsonSerializerOptions { WriteIndented = true }), Encoding.UTF8);
-
-        _statusLabel.Text = $"已导出数据集：{outputFolder}";
-        MessageBox.Show(this, $"已导出 {labeledImages.Length} 张已标注图片。", "导出完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        return labeledImages.Length;
     }
 
     private void ExportLabelBundle()
@@ -754,6 +813,243 @@ internal sealed class MainForm : Form
     private void ResetCanvasView()
     {
         _canvas.ResetView();
+    }
+
+    private async Task TrainAndExportOnnxAsync()
+    {
+        if (_isTraining)
+            return;
+
+        if (String.IsNullOrWhiteSpace(_currentFolder))
+        {
+            MessageBox.Show(this, "请先打开并标注一个图片目录。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        SaveAllAnnotations();
+
+        if (!Int32.TryParse(_trainEpochsTextBox.Text.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var epochs) || epochs <= 0)
+        {
+            MessageBox.Show(this, "Epochs 必须是正整数。", "参数错误", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (!Int32.TryParse(_trainBatchTextBox.Text.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var batch) || batch <= 0)
+        {
+            MessageBox.Show(this, "Batch 必须是正整数。", "参数错误", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (!Int32.TryParse(_trainImageSizeTextBox.Text.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var imageSize) || imageSize <= 0)
+        {
+            MessageBox.Show(this, "图像尺寸必须是正整数。", "参数错误", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        var baseModel = _trainBaseModelTextBox.Text.Trim();
+        if (String.IsNullOrWhiteSpace(baseModel))
+        {
+            MessageBox.Show(this, "基础模型不能为空，例如 yolov8n.pt。", "参数错误", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        var device = _trainDeviceTextBox.Text.Trim();
+        if (String.IsNullOrWhiteSpace(device))
+            device = "cpu";
+
+        var datasetFolder = Path.Combine(_currentFolder, "yolo");
+        var runRoot = Path.Combine(_currentFolder, "training-runs");
+        var runName = $"stamp_{DateTime.Now:yyyyMMdd_HHmmss}";
+        var datasetCount = ExportDatasetToFolder(datasetFolder);
+        if (datasetCount == 0)
+        {
+            MessageBox.Show(this, "当前没有已标注图片，无法训练。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var trainingScriptPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "Pek.AI.StampDetectionDemo", "Training", "train_yolo.py"));
+        if (!File.Exists(trainingScriptPath))
+        {
+            MessageBox.Show(this, $"未找到训练脚本：{trainingScriptPath}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        _isTraining = true;
+        SetTrainingControlsEnabled(false);
+        _statusLabel.Text = $"开始训练：数据集 {datasetFolder}，运行名 {runName}";
+
+        try
+        {
+            var processResult = await RunTrainingProcessAsync(trainingScriptPath, datasetFolder, runRoot, runName, baseModel, imageSize, epochs, batch, device);
+            if (processResult.ExitCode != 0)
+            {
+                MessageBox.Show(this, processResult.Output, "训练失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                _statusLabel.Text = "训练失败，请查看错误输出。";
+                return;
+            }
+
+            var onnxPath = Path.Combine(runRoot, runName, "weights", "best.onnx");
+            if (_openOnnxAfterTrainCheckBox.Checked && File.Exists(onnxPath))
+            {
+                _modelPathTextBox.Text = onnxPath;
+                _statusLabel.Text = $"训练完成，已导出 ONNX：{onnxPath}";
+            }
+            else
+            {
+                _statusLabel.Text = $"训练完成：{Path.Combine(runRoot, runName)}";
+            }
+
+            MessageBox.Show(this, processResult.Output, "训练完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "训练失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            _statusLabel.Text = $"训练失败：{ex.Message}";
+        }
+        finally
+        {
+            _isTraining = false;
+            SetTrainingControlsEnabled(true);
+        }
+    }
+
+    private void SetTrainingControlsEnabled(Boolean enabled)
+    {
+        _trainBaseModelTextBox.Enabled = enabled;
+        _trainEpochsTextBox.Enabled = enabled;
+        _trainBatchTextBox.Enabled = enabled;
+        _trainImageSizeTextBox.Enabled = enabled;
+        _trainDeviceTextBox.Enabled = enabled;
+        _openOnnxAfterTrainCheckBox.Enabled = enabled;
+    }
+
+    private static async Task<TrainingProcessResult> RunTrainingProcessAsync(String trainingScriptPath, String datasetFolder, String runRoot, String runName, String baseModel, Int32 imageSize, Int32 epochs, Int32 batch, String device)
+    {
+        var pythonLauncher = ResolvePythonLauncher();
+        var datasetYamlPath = Path.Combine(datasetFolder, "dataset.yaml");
+        var arguments = BuildTrainingArguments(pythonLauncher.ArgumentPrefix, trainingScriptPath, datasetYamlPath, runRoot, runName, baseModel, imageSize, epochs, batch, device);
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = pythonLauncher.FileName,
+            Arguments = arguments,
+            WorkingDirectory = Path.GetDirectoryName(trainingScriptPath)!,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8
+        };
+
+        var outputBuilder = new StringBuilder();
+        using var process = new Process { StartInfo = startInfo };
+        process.OutputDataReceived += (_, args) =>
+        {
+            if (!String.IsNullOrWhiteSpace(args.Data))
+                outputBuilder.AppendLine(args.Data);
+        };
+        process.ErrorDataReceived += (_, args) =>
+        {
+            if (!String.IsNullOrWhiteSpace(args.Data))
+                outputBuilder.AppendLine(args.Data);
+        };
+
+        if (!process.Start())
+            throw new InvalidOperationException("训练进程启动失败。请确认已安装 Python。\n建议先执行：pip install ultralytics");
+
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+        await process.WaitForExitAsync().ConfigureAwait(true);
+
+        return new TrainingProcessResult(process.ExitCode, outputBuilder.ToString());
+    }
+
+    private static TrainingPythonLauncher ResolvePythonLauncher()
+    {
+        var candidates = OperatingSystem.IsWindows()
+            ? new[]
+            {
+                new TrainingPythonLauncher("python", String.Empty),
+                new TrainingPythonLauncher("py", "-3"),
+                new TrainingPythonLauncher("py", String.Empty)
+            }
+            : new[]
+            {
+                new TrainingPythonLauncher("python3", String.Empty),
+                new TrainingPythonLauncher("python", String.Empty)
+            };
+
+        foreach (var candidate in candidates)
+        {
+            if (CanImportUltralytics(candidate))
+                return candidate;
+        }
+
+        throw new InvalidOperationException("未找到可用的 Python 训练环境。请先安装 Python，并在同一个解释器里执行 pip install ultralytics。当前工具已尝试 python、py -3 等常见启动方式。");
+    }
+
+    private static String BuildTrainingArguments(String argumentPrefix, String trainingScriptPath, String datasetYamlPath, String runRoot, String runName, String baseModel, Int32 imageSize, Int32 epochs, Int32 batch, String device)
+    {
+        var builder = new StringBuilder();
+        if (!String.IsNullOrWhiteSpace(argumentPrefix))
+        {
+            builder.Append(argumentPrefix);
+            builder.Append(' ');
+        }
+
+        builder.Append('"');
+        builder.Append(trainingScriptPath);
+        builder.Append('"');
+        builder.Append(" --data \"");
+        builder.Append(datasetYamlPath);
+        builder.Append("\" --model ");
+        builder.Append(baseModel);
+        builder.Append(" --imgsz ");
+        builder.Append(imageSize.ToString(CultureInfo.InvariantCulture));
+        builder.Append(" --epochs ");
+        builder.Append(epochs.ToString(CultureInfo.InvariantCulture));
+        builder.Append(" --batch ");
+        builder.Append(batch.ToString(CultureInfo.InvariantCulture));
+        builder.Append(" --device ");
+        builder.Append(device);
+        builder.Append(" --project \"");
+        builder.Append(runRoot);
+        builder.Append("\" --name ");
+        builder.Append(runName);
+        return builder.ToString();
+    }
+
+    private static Boolean CanImportUltralytics(TrainingPythonLauncher launcher)
+    {
+        try
+        {
+            var command = !String.IsNullOrWhiteSpace(launcher.ArgumentPrefix)
+                ? $"{launcher.ArgumentPrefix} -c \"import ultralytics\""
+                : "-c \"import ultralytics\"";
+            using var process = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = launcher.FileName,
+                    Arguments = command,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                }
+            };
+
+            if (!process.Start())
+                return false;
+
+            process.WaitForExit(5000);
+            return process.HasExited && process.ExitCode == 0;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private String BuildDatasetYaml(String outputFolder)
@@ -1827,3 +2123,7 @@ internal sealed class OnnxPreAnnotationDetector : IDisposable
         return union <= 0 ? 0 : intersection / union;
     }
 }
+
+internal sealed record TrainingProcessResult(Int32 ExitCode, String Output);
+
+internal sealed record TrainingPythonLauncher(String FileName, String ArgumentPrefix);

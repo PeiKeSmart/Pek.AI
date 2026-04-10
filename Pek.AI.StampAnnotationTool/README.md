@@ -35,6 +35,7 @@ dotnet run --project .\Pek.AI.StampAnnotationTool\Pek.AI.StampAnnotationTool.csp
 13. 点击“保存当前”或“全部保存”
 14. 点击“导出 YOLO 数据集”生成训练目录
 15. 点击“导出轻量标签”只导出标签文件、`labels.txt` 和 `annotations.json`
+16. 点击“训练并导出 ONNX”可以直接调用仓库内的 YOLO 训练脚本，自动导出 `best.onnx`
 
 ## 与当前 ONNX Demo 的配合
 
@@ -45,6 +46,34 @@ dotnet run --project .\Pek.AI.StampDetectionDemo\Pek.AI.StampDetectionDemo.cspro
 ```
 
 这样可以保证训练时类别顺序与推理时类别顺序一致。
+
+## 训练与导出模型
+
+当前标注工具已经内置“训练并导出 ONNX”入口，流程是：
+
+1. 先自动导出当前图片目录下的 `yolo/` 数据集
+2. 调用仓库中的 `Pek.AI.StampDetectionDemo/Training/train_yolo.py`
+3. 训练完成后自动导出 `best.onnx`
+4. 可选自动把导出的 `best.onnx` 回填到“预标注模型”输入框中
+
+前置要求：
+
+1. 本机已安装 Python
+2. 已安装 `ultralytics`
+
+安装示例：
+
+```powershell
+pip install ultralytics
+```
+
+默认参数可以在界面中修改，包括：
+
+1. 基础模型，例如 `yolov8n.pt`
+2. `epochs`
+3. `batch`
+4. 图像尺寸 `imgsz`
+5. 训练设备 `device`，例如 `cpu`、`0`
 
 ## 自动预标注说明
 

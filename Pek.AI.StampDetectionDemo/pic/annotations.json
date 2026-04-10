@@ -37,7 +37,7 @@
   {
     "ImageFile": "strict-2-full.png",
     "AnnotationFile": "labels/strict-2-full.txt",
-    "Count": 0
+    "Count": 2
   },
   {
     "ImageFile": "strict-2-half-two-stamps.png",

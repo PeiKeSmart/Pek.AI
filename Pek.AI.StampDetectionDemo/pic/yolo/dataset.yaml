@@ -1,0 +1,7 @@
+﻿path: F:/Code/Pek.FrameWork/Pek.AI/Pek.AI.StampDetectionDemo/pic/yolo
+train: images/train
+val: images/val
+
+names:
+  0: seal
+  1: partial-seal
