@@ -342,6 +342,22 @@ internal sealed class StampDetectionPipeline
             return false;
         }
 
+        var contourUnion = selectedContours
+            .Select(item => item.Rect)
+            .Aggregate((current, next) => UnionRects(current, next));
+        var tightRect = InflateRect(
+            new Rect(contourUnion.X + padded.X, contourUnion.Y + padded.Y, contourUnion.Width, contourUnion.Height),
+            image.Width,
+            image.Height,
+            4);
+
+        var tightAspectRatio = tightRect.Width / (Single)Math.Max(1, tightRect.Height);
+        if (tightAspectRatio is > 0.75f and < 1.25f)
+        {
+            fittedRect = tightRect;
+            return true;
+        }
+
         var allPoints = selectedContours.SelectMany(item => item.Contour).ToArray();
         if (allPoints.Length < 5)
         {
