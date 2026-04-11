@@ -658,6 +658,7 @@ internal sealed class OpenCvSealCandidateDetector
         Cv2.FindContours(mask, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
         var detections = new List<SealDetection>();
         var imageArea = source.Width * source.Height;
+        var minimumSealSide = Math.Max(18f, Math.Min(source.Width, source.Height) * 0.018f);
 
         foreach (var contour in contours)
         {
@@ -681,12 +682,23 @@ internal sealed class OpenCvSealCandidateDetector
 
             var fillRatio = (Single)(area / rectArea);
             var touchesEdge = TouchesImageEdge(rect, source.Width, source.Height);
-            var partialCandidate = allowPartial && (touchesEdge || circularity < 0.22 || fillRatio < 0.2f);
+            var partialCandidate = allowPartial && touchesEdge;
+            var minimumSide = Math.Min(rect.Width, rect.Height);
+            var maximumSide = Math.Max(rect.Width, rect.Height);
+
+            if (!partialCandidate && minimumSide < minimumSealSide)
+                continue;
+
+            if (partialCandidate && maximumSide < minimumSealSide)
+                continue;
 
             if (!partialCandidate && circularity < 0.12 && (aspectRatio < 0.7f || aspectRatio > 1.4f))
                 continue;
 
             if (partialCandidate && fillRatio < 0.06f)
+                continue;
+
+            if (String.Equals(channelName, "opencv-red", StringComparison.Ordinal) && !partialCandidate && (aspectRatio < 0.55f || aspectRatio > 1.8f))
                 continue;
 
             var roi = new Mat(source, rect);
@@ -859,6 +871,9 @@ internal sealed class OpenCvSealCandidateDetector
         if (ShouldKeepSeparateEdgePartials(first, second, imageWidth, imageHeight))
             return false;
 
+        if (ShouldKeepSeparateDistinctSeals(first, second))
+            return false;
+
         var union = Union(first.Box, second.Box);
         var maxWidth = Math.Max(first.Box.Width, second.Box.Width);
         var maxHeight = Math.Max(first.Box.Height, second.Box.Height);
@@ -893,6 +908,32 @@ internal sealed class OpenCvSealCandidateDetector
             return true;
 
         if ((touchesLeft || touchesRight) && gapY > maxHeight * 0.35f)
+            return true;
+
+        return false;
+    }
+
+    private static Boolean ShouldKeepSeparateDistinctSeals(SealDetection first, SealDetection second)
+    {
+        if (first.Label == "partial-seal" || second.Label == "partial-seal")
+            return false;
+
+        if (ComputeRectIou(first.Box, second.Box) > 0.01f)
+            return false;
+
+        var gapX = Math.Max(0, Math.Max(first.Box.Left, second.Box.Left) - Math.Min(first.Box.Right, second.Box.Right));
+        var gapY = Math.Max(0, Math.Max(first.Box.Top, second.Box.Top) - Math.Min(first.Box.Bottom, second.Box.Bottom));
+        var maxWidth = Math.Max(first.Box.Width, second.Box.Width);
+        var maxHeight = Math.Max(first.Box.Height, second.Box.Height);
+        var centerDeltaX = Math.Abs((first.Box.Left + first.Box.Right) - (second.Box.Left + second.Box.Right)) / 2f;
+        var centerDeltaY = Math.Abs((first.Box.Top + first.Box.Bottom) - (second.Box.Top + second.Box.Bottom)) / 2f;
+        var horizontalGapThreshold = Math.Max(10f, Math.Min(first.Box.Width, second.Box.Width) * 0.08f);
+        var verticalGapThreshold = Math.Max(10f, Math.Min(first.Box.Height, second.Box.Height) * 0.08f);
+
+        if (gapX >= horizontalGapThreshold && centerDeltaY <= maxHeight * 0.45f)
+            return true;
+
+        if (gapY >= verticalGapThreshold && centerDeltaX <= maxWidth * 0.45f)
             return true;
 
         return false;
