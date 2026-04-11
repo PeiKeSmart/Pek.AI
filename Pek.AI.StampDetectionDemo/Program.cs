@@ -718,10 +718,182 @@ internal sealed class OpenCvSealCandidateDetector
             var finalRect = partialCandidate && String.Equals(channelName, "opencv-red", StringComparison.Ordinal)
                 ? ExpandPartialDetectionRect(rect, source.Width, source.Height)
                 : rect;
+
+            if (TrySplitMergedRedDetection(mask, finalRect, channelName, partialCandidate, minimumSealSide, out var splitRects))
+            {
+                foreach (var splitRect in splitRects)
+                {
+                    var splitRoi = new Mat(source, splitRect);
+                    var splitEdgeDensity = ComputeEdgeDensity(splitRoi);
+                    var splitStrokeDensity = ComputeStrokeDensity(mask, splitRect);
+                    var splitScore = MathF.Min(0.95f,
+                        MathF.Max(score, 0.22f)
+                        + MathF.Min(0.08f, splitEdgeDensity * 0.5f)
+                        + MathF.Min(0.08f, splitStrokeDensity * 0.35f));
+                    detections.Add(new SealDetection(splitRect, splitScore, 0, "seal", channelName));
+                }
+
+                continue;
+            }
+
             detections.Add(new SealDetection(finalRect, MathF.Min(0.95f, score), 0, partialCandidate ? "partial-seal" : "seal", channelName));
         }
 
         return detections;
+    }
+
+    private static Boolean TrySplitMergedRedDetection(Mat mask, Rect rect, String channelName, Boolean partialCandidate, Single minimumSealSide, out IReadOnlyList<Rect> splitRects)
+    {
+        splitRects = [];
+        if (partialCandidate || !String.Equals(channelName, "opencv-red", StringComparison.Ordinal))
+            return false;
+
+        var aspectRatio = rect.Width / (Single)Math.Max(1, rect.Height);
+        if (aspectRatio < 1.45f)
+            return false;
+
+        using var roi = new Mat(mask, rect);
+        var minimumProjection = Math.Max(3, (Int32)MathF.Ceiling(rect.Height * 0.08f));
+        var minimumGapWidth = Math.Max(10, (Int32)MathF.Ceiling(rect.Width * 0.035f));
+        var minimumSegmentWidth = Math.Max((Int32)MathF.Ceiling(minimumSealSide * 0.8f), (Int32)MathF.Ceiling(rect.Width * 0.18f));
+        var segments = CollectProjectionSegments(roi, minimumProjection, minimumGapWidth, minimumSegmentWidth);
+        if (segments.Count < 2)
+            return false;
+
+        var rects = new List<Rect>(segments.Count);
+        foreach (var segment in segments)
+        {
+            var segmentRect = TryBuildSegmentRect(roi, rect, segment.Start, segment.EndExclusive, minimumSealSide);
+            if (segmentRect == null)
+                continue;
+
+            rects.Add(segmentRect.Value);
+        }
+
+        if (rects.Count < 2)
+            return false;
+
+        var ordered = rects.OrderBy(item => item.Left).ToList();
+        var totalWidth = ordered.Sum(item => item.Width);
+        if (totalWidth < rect.Width * 0.45f)
+            return false;
+
+        splitRects = ordered;
+        return true;
+    }
+
+    private static List<(Int32 Start, Int32 EndExclusive)> CollectProjectionSegments(Mat roi, Int32 minimumProjection, Int32 minimumGapWidth, Int32 minimumSegmentWidth)
+    {
+        var segments = new List<(Int32 Start, Int32 EndExclusive)>();
+        var start = -1;
+        var gapWidth = 0;
+
+        for (var column = 0; column < roi.Width; column++)
+        {
+            var projection = Cv2.CountNonZero(roi.Col(column));
+            var active = projection >= minimumProjection;
+
+            if (active)
+            {
+                if (start < 0)
+                    start = column;
+
+                gapWidth = 0;
+                continue;
+            }
+
+            if (start < 0)
+                continue;
+
+            gapWidth++;
+            if (gapWidth < minimumGapWidth)
+                continue;
+
+            var endExclusive = column - gapWidth + 1;
+            if (endExclusive - start >= minimumSegmentWidth)
+                segments.Add((start, endExclusive));
+
+            start = -1;
+            gapWidth = 0;
+        }
+
+        if (start >= 0)
+        {
+            var endExclusive = roi.Width;
+            if (endExclusive - start >= minimumSegmentWidth)
+                segments.Add((start, endExclusive));
+        }
+
+        return segments;
+    }
+
+    private static Rect? TryBuildSegmentRect(Mat roi, Rect baseRect, Int32 startColumn, Int32 endExclusiveColumn, Single minimumSealSide)
+    {
+        if (endExclusiveColumn <= startColumn)
+            return null;
+
+        using var columnSlice = new Mat(roi, new Rect(startColumn, 0, endExclusiveColumn - startColumn, roi.Height));
+        var left = -1;
+        var right = -1;
+        var top = -1;
+        var bottom = -1;
+
+        for (var column = 0; column < columnSlice.Width; column++)
+        {
+            if (Cv2.CountNonZero(columnSlice.Col(column)) == 0)
+                continue;
+
+            left = column;
+            break;
+        }
+
+        if (left < 0)
+            return null;
+
+        for (var column = columnSlice.Width - 1; column >= left; column--)
+        {
+            if (Cv2.CountNonZero(columnSlice.Col(column)) == 0)
+                continue;
+
+            right = column;
+            break;
+        }
+
+        for (var row = 0; row < columnSlice.Height; row++)
+        {
+            if (Cv2.CountNonZero(columnSlice.Row(row)) == 0)
+                continue;
+
+            top = row;
+            break;
+        }
+
+        if (top < 0)
+            return null;
+
+        for (var row = columnSlice.Height - 1; row >= top; row--)
+        {
+            if (Cv2.CountNonZero(columnSlice.Row(row)) == 0)
+                continue;
+
+            bottom = row;
+            break;
+        }
+
+        var localRect = new Rect(left, top, right - left + 1, bottom - top + 1);
+        if (localRect.Width < minimumSealSide * 0.65f || localRect.Height < minimumSealSide * 0.65f)
+            return null;
+
+        var segmentRect = new Rect(
+            baseRect.Left + startColumn + localRect.Left,
+            baseRect.Top + localRect.Top,
+            localRect.Width,
+            localRect.Height);
+        var aspectRatio = segmentRect.Width / (Single)Math.Max(1, segmentRect.Height);
+        if (aspectRatio is < 0.3f or > 2.2f)
+            return null;
+
+        return segmentRect;
     }
 
     private static Rect ExpandPartialDetectionRect(Rect rect, Int32 imageWidth, Int32 imageHeight)
@@ -805,7 +977,7 @@ internal sealed class OpenCvSealCandidateDetector
 
         foreach (var neutral in neutralDetections)
         {
-            var relatedRedDetections = redDetections.Where(red => IsNearRelatedDetection(red.Box, neutral.Box)).ToList();
+            var relatedRedDetections = redDetections.Where(red => IsSupportingNeutralDetection(red.Box, neutral.Box)).ToList();
             if (relatedRedDetections.Count == 0)
                 continue;
 
@@ -813,6 +985,11 @@ internal sealed class OpenCvSealCandidateDetector
                 continue;
 
             var relatedRed = relatedRedDetections[0];
+            var neutralArea = neutral.Box.Width * neutral.Box.Height;
+            var redArea = relatedRed.Box.Width * relatedRed.Box.Height;
+            if (neutralArea < redArea * 0.18f)
+                continue;
+
             if (neutral.Box.Width > relatedRed.Box.Width * 1.45f || neutral.Box.Height > relatedRed.Box.Height * 1.45f)
                 continue;
 
@@ -834,6 +1011,25 @@ internal sealed class OpenCvSealCandidateDetector
         var centerDeltaX = Math.Abs((anchor.Left + anchor.Right) - (candidate.Left + candidate.Right)) / 2f;
         var centerDeltaY = Math.Abs((anchor.Top + anchor.Bottom) - (candidate.Top + candidate.Bottom)) / 2f;
         return centerDeltaX <= maxWidth * 0.9f && centerDeltaY <= maxHeight * 0.9f && union.Width <= maxWidth * 1.9f && union.Height <= maxHeight * 1.9f;
+    }
+
+    private static Boolean IsSupportingNeutralDetection(Rect redBox, Rect neutralBox)
+    {
+        if (ComputeRectIou(redBox, neutralBox) > 0.01f)
+            return true;
+
+        var expandedLeft = redBox.Left - Math.Max(12, (Int32)MathF.Ceiling(redBox.Width * 0.08f));
+        var expandedTop = redBox.Top - Math.Max(12, (Int32)MathF.Ceiling(redBox.Height * 0.08f));
+        var expandedRight = redBox.Right + Math.Max(12, (Int32)MathF.Ceiling(redBox.Width * 0.08f));
+        var expandedBottom = redBox.Bottom + Math.Max(12, (Int32)MathF.Ceiling(redBox.Height * 0.08f));
+        var centerX = (neutralBox.Left + neutralBox.Right) / 2f;
+        var centerY = (neutralBox.Top + neutralBox.Bottom) / 2f;
+        if (centerX < expandedLeft || centerX > expandedRight || centerY < expandedTop || centerY > expandedBottom)
+            return false;
+
+        var gapX = Math.Max(0, Math.Max(redBox.Left, neutralBox.Left) - Math.Min(redBox.Right, neutralBox.Right));
+        var gapY = Math.Max(0, Math.Max(redBox.Top, neutralBox.Top) - Math.Min(redBox.Bottom, neutralBox.Bottom));
+        return gapX <= Math.Max(12f, redBox.Width * 0.1f) && gapY <= Math.Max(12f, redBox.Height * 0.1f);
     }
 
     private static IReadOnlyList<SealDetection> MergeNearbyDetections(IReadOnlyList<SealDetection> detections, Int32 imageWidth, Int32 imageHeight)
