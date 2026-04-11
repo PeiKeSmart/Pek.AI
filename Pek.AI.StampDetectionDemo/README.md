@@ -40,7 +40,7 @@ dotnet run --project Pek.AI.StampDetectionDemo -- --input D:\sample\seal.pdf --m
 
 - 没有提供模型时，最终计数直接采用 OpenCV 候选结果
 - 提供模型后，最终计数优先采用 ONNX 检测结果
-- 这个 Demo 默认偏向识别红色圆章、椭圆章；如果是黑白扫描章或电子章，建议训练专门的 YOLO 模型
+- 这个 Demo 默认偏向识别红色圆章、椭圆章，同时补充了实验性的灰章结构检测；复杂的黑白扫描章、电子章场景仍建议训练专门的 YOLO 模型兜底
 
 ## 模型训练
 

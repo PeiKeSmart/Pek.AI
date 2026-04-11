@@ -655,13 +655,18 @@ internal sealed class OpenCvSealCandidateDetector
 
     private static IReadOnlyList<SealDetection> DetectFromMask(Mat source, Mat mask, String channelName, Boolean allowPartial)
     {
-        Cv2.FindContours(mask, out var contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+        Cv2.FindContours(mask, out var contours, out var hierarchy, RetrievalModes.Tree, ContourApproximationModes.ApproxSimple);
         var detections = new List<SealDetection>();
         var imageArea = source.Width * source.Height;
         var minimumSealSide = Math.Max(18f, Math.Min(source.Width, source.Height) * 0.018f);
+        var isNeutralChannel = String.Equals(channelName, "opencv-neutral", StringComparison.Ordinal);
 
-        foreach (var contour in contours)
+        for (var contourIndex = 0; contourIndex < contours.Length; contourIndex++)
         {
+            if (hierarchy.Length > contourIndex && hierarchy[contourIndex].Parent >= 0)
+                continue;
+
+            var contour = contours[contourIndex];
             var area = Cv2.ContourArea(contour);
             if (area < 120 || area > imageArea * 0.35)
                 continue;
@@ -707,11 +712,18 @@ internal sealed class OpenCvSealCandidateDetector
             if (edgeDensity < 0.015f && strokeDensity < 0.04f)
                 continue;
 
-            var saturationDensity = String.Equals(channelName, "opencv-neutral", StringComparison.Ordinal)
+            var saturationDensity = isNeutralChannel
                 ? ComputeSaturationDensity(roi)
                 : 0f;
-            if (String.Equals(channelName, "opencv-neutral", StringComparison.Ordinal) && saturationDensity < 0.015f)
-                continue;
+            var grayscaleStructureScore = 0f;
+            if (isNeutralChannel && saturationDensity < 0.015f)
+            {
+                var holeRatio = ComputeHoleRatio(contours, hierarchy, contourIndex, area);
+                grayscaleStructureScore = ComputeGrayscaleSealScore(mask, rect, aspectRatio, circularity, fillRatio, edgeDensity, strokeDensity, holeRatio);
+                var minimumGraySealScore = partialCandidate ? 0.42f : 0.5f;
+                if (grayscaleStructureScore < minimumGraySealScore)
+                    continue;
+            }
 
             var score = 0.2f;
             score += MathF.Min(0.3f, MathF.Max(0f, (Single)circularity * 0.35f));
@@ -719,12 +731,14 @@ internal sealed class OpenCvSealCandidateDetector
             score += MathF.Min(0.2f, edgeDensity * 1.4f);
             score += MathF.Min(0.2f, strokeDensity * 0.8f);
             score += MathF.Min(0.15f, saturationDensity * 1.8f);
+            score += MathF.Min(0.18f, grayscaleStructureScore * 0.18f);
             if (partialCandidate)
                 score = MathF.Max(score, 0.38f);
 
             var finalRect = partialCandidate && String.Equals(channelName, "opencv-red", StringComparison.Ordinal)
                 ? ExpandPartialDetectionRect(rect, source.Width, source.Height)
                 : rect;
+            var detectionSource = grayscaleStructureScore > 0f ? "opencv-gray" : channelName;
 
             if (TrySplitMergedRedDetection(mask, finalRect, channelName, partialCandidate, minimumSealSide, out var splitRects))
             {
@@ -737,13 +751,13 @@ internal sealed class OpenCvSealCandidateDetector
                         MathF.Max(score, 0.22f)
                         + MathF.Min(0.08f, splitEdgeDensity * 0.5f)
                         + MathF.Min(0.08f, splitStrokeDensity * 0.35f));
-                    detections.Add(new SealDetection(splitRect, splitScore, 0, "seal", channelName));
+                    detections.Add(new SealDetection(splitRect, splitScore, 0, "seal", detectionSource));
                 }
 
                 continue;
             }
 
-            detections.Add(new SealDetection(finalRect, MathF.Min(0.95f, score), 0, partialCandidate ? "partial-seal" : "seal", channelName));
+            detections.Add(new SealDetection(finalRect, MathF.Min(0.95f, score), 0, partialCandidate ? "partial-seal" : "seal", detectionSource));
         }
 
         return detections;
@@ -985,6 +999,140 @@ internal sealed class OpenCvSealCandidateDetector
         Cv2.CvtColor(roi, hsv, ColorConversionCodes.BGR2HSV);
         Cv2.InRange(hsv, new Scalar(0, 35, 0), new Scalar(180, 255, 255), saturated);
         return Cv2.CountNonZero(saturated) / (Single)Math.Max(1, roi.Width * roi.Height);
+    }
+
+    private static Single ComputeGrayscaleSealScore(Mat mask, Rect rect, Single aspectRatio, Double circularity, Single fillRatio, Single edgeDensity, Single strokeDensity, Single holeRatio)
+    {
+        using var roi = new Mat(mask, rect);
+        var outerBandDensity = ComputeOuterBandDensity(roi);
+        var centerDensity = ComputeCenterDensity(roi);
+        var cornerDensity = ComputeCornerDensity(roi);
+        var axisBalance = ComputeAxisBalance(roi);
+
+        var aspectScore = 1f - Math.Clamp(Math.Abs(1f - aspectRatio) / 0.75f, 0f, 1f);
+        var circularityScore = NormalizeScore((Single)circularity, 0.14f, 0.52f);
+        var holeScore = NormalizeScore(holeRatio, 0.04f, 0.24f);
+        var ringScore = NormalizeScore(outerBandDensity - centerDensity, 0.03f, 0.22f);
+        var edgeScore = NormalizeScore(edgeDensity, 0.02f, 0.11f);
+        var strokeScore = NormalizeScore(strokeDensity, 0.05f, 0.28f);
+        var cornerPenalty = NormalizeScore(cornerDensity, 0.18f, 0.42f);
+        var fillPenalty = NormalizeScore(fillRatio, 0.62f, 0.92f);
+
+        var score = 0f;
+        score += aspectScore * 0.2f;
+        score += circularityScore * 0.2f;
+        score += holeScore * 0.2f;
+        score += ringScore * 0.16f;
+        score += axisBalance * 0.12f;
+        score += edgeScore * 0.06f;
+        score += strokeScore * 0.06f;
+        score -= cornerPenalty * 0.12f;
+        score -= fillPenalty * 0.08f;
+
+        if (cornerDensity >= outerBandDensity * 0.95f)
+            score -= 0.08f;
+
+        if (centerDensity >= outerBandDensity * 0.9f)
+            score -= 0.08f;
+
+        if (holeRatio <= 0.01f && circularity < 0.2)
+            score -= 0.08f;
+
+        return Math.Clamp(score, 0f, 1f);
+    }
+
+    private static Single ComputeHoleRatio(Point[][] contours, HierarchyIndex[] hierarchy, Int32 contourIndex, Double contourArea)
+    {
+        if (hierarchy.Length <= contourIndex || contourArea <= 0)
+            return 0f;
+
+        var childIndex = hierarchy[contourIndex].Child;
+        if (childIndex < 0)
+            return 0f;
+
+        var childArea = 0d;
+        while (childIndex >= 0)
+        {
+            childArea += Math.Abs(Cv2.ContourArea(contours[childIndex]));
+            childIndex = hierarchy[childIndex].Next;
+        }
+
+        return Math.Clamp((Single)(childArea / contourArea), 0f, 1f);
+    }
+
+    private static Single ComputeOuterBandDensity(Mat roi)
+    {
+        var insetX = Math.Max(1, (Int32)MathF.Floor(roi.Width * 0.22f));
+        var insetY = Math.Max(1, (Int32)MathF.Floor(roi.Height * 0.22f));
+        if (roi.Width <= insetX * 2 || roi.Height <= insetY * 2)
+            return Cv2.CountNonZero(roi) / (Single)Math.Max(1, roi.Width * roi.Height);
+
+        using var inner = new Mat(roi, new Rect(insetX, insetY, roi.Width - insetX * 2, roi.Height - insetY * 2));
+        var totalCount = Cv2.CountNonZero(roi);
+        var innerCount = Cv2.CountNonZero(inner);
+        var outerArea = roi.Width * roi.Height - inner.Width * inner.Height;
+        return outerArea <= 0 ? 0f : (totalCount - innerCount) / (Single)outerArea;
+    }
+
+    private static Single ComputeCenterDensity(Mat roi)
+    {
+        var width = Math.Max(1, (Int32)MathF.Floor(roi.Width * 0.34f));
+        var height = Math.Max(1, (Int32)MathF.Floor(roi.Height * 0.34f));
+        var left = Math.Max(0, (roi.Width - width) / 2);
+        var top = Math.Max(0, (roi.Height - height) / 2);
+        using var center = new Mat(roi, new Rect(left, top, Math.Min(width, roi.Width - left), Math.Min(height, roi.Height - top)));
+        return Cv2.CountNonZero(center) / (Single)Math.Max(1, center.Width * center.Height);
+    }
+
+    private static Single ComputeCornerDensity(Mat roi)
+    {
+        var width = Math.Max(1, (Int32)MathF.Floor(roi.Width * 0.22f));
+        var height = Math.Max(1, (Int32)MathF.Floor(roi.Height * 0.22f));
+        var cornerRects = new[]
+        {
+            new Rect(0, 0, width, height),
+            new Rect(Math.Max(0, roi.Width - width), 0, width, height),
+            new Rect(0, Math.Max(0, roi.Height - height), width, height),
+            new Rect(Math.Max(0, roi.Width - width), Math.Max(0, roi.Height - height), width, height)
+        };
+
+        var active = 0;
+        var area = 0;
+        foreach (var cornerRect in cornerRects)
+        {
+            using var corner = new Mat(roi, cornerRect);
+            active += Cv2.CountNonZero(corner);
+            area += corner.Width * corner.Height;
+        }
+
+        return active / (Single)Math.Max(1, area);
+    }
+
+    private static Single ComputeAxisBalance(Mat roi)
+    {
+        var halfWidth = Math.Max(1, roi.Width / 2);
+        var halfHeight = Math.Max(1, roi.Height / 2);
+        using var left = new Mat(roi, new Rect(0, 0, halfWidth, roi.Height));
+        using var right = new Mat(roi, new Rect(roi.Width - halfWidth, 0, halfWidth, roi.Height));
+        using var top = new Mat(roi, new Rect(0, 0, roi.Width, halfHeight));
+        using var bottom = new Mat(roi, new Rect(0, roi.Height - halfHeight, roi.Width, halfHeight));
+
+        var leftDensity = Cv2.CountNonZero(left) / (Single)Math.Max(1, left.Width * left.Height);
+        var rightDensity = Cv2.CountNonZero(right) / (Single)Math.Max(1, right.Width * right.Height);
+        var topDensity = Cv2.CountNonZero(top) / (Single)Math.Max(1, top.Width * top.Height);
+        var bottomDensity = Cv2.CountNonZero(bottom) / (Single)Math.Max(1, bottom.Width * bottom.Height);
+
+        var horizontalBalance = 1f - Math.Min(1f, Math.Abs(leftDensity - rightDensity) / Math.Max(0.01f, Math.Max(leftDensity, rightDensity)));
+        var verticalBalance = 1f - Math.Min(1f, Math.Abs(topDensity - bottomDensity) / Math.Max(0.01f, Math.Max(topDensity, bottomDensity)));
+        return (horizontalBalance + verticalBalance) * 0.5f;
+    }
+
+    private static Single NormalizeScore(Single value, Single min, Single max)
+    {
+        if (max <= min)
+            return value >= max ? 1f : 0f;
+
+        return Math.Clamp((value - min) / (max - min), 0f, 1f);
     }
 
     private static List<SealDetection> FilterNeutralDetectionsNearRed(IReadOnlyList<SealDetection> redDetections, IReadOnlyList<SealDetection> neutralDetections)
