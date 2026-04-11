@@ -701,10 +701,16 @@ internal sealed class OpenCvSealCandidateDetector
             if (String.Equals(channelName, "opencv-red", StringComparison.Ordinal) && !partialCandidate && (aspectRatio < 0.55f || aspectRatio > 1.8f))
                 continue;
 
-            var roi = new Mat(source, rect);
+            using var roi = new Mat(source, rect);
             var edgeDensity = ComputeEdgeDensity(roi);
             var strokeDensity = ComputeStrokeDensity(mask, rect);
             if (edgeDensity < 0.015f && strokeDensity < 0.04f)
+                continue;
+
+            var saturationDensity = String.Equals(channelName, "opencv-neutral", StringComparison.Ordinal)
+                ? ComputeSaturationDensity(roi)
+                : 0f;
+            if (String.Equals(channelName, "opencv-neutral", StringComparison.Ordinal) && saturationDensity < 0.015f)
                 continue;
 
             var score = 0.2f;
@@ -712,6 +718,7 @@ internal sealed class OpenCvSealCandidateDetector
             score += MathF.Min(0.2f, fillRatio * 0.3f);
             score += MathF.Min(0.2f, edgeDensity * 1.4f);
             score += MathF.Min(0.2f, strokeDensity * 0.8f);
+            score += MathF.Min(0.15f, saturationDensity * 1.8f);
             if (partialCandidate)
                 score = MathF.Max(score, 0.38f);
 
@@ -723,7 +730,7 @@ internal sealed class OpenCvSealCandidateDetector
             {
                 foreach (var splitRect in splitRects)
                 {
-                    var splitRoi = new Mat(source, splitRect);
+                    using var splitRoi = new Mat(source, splitRect);
                     var splitEdgeDensity = ComputeEdgeDensity(splitRoi);
                     var splitStrokeDensity = ComputeStrokeDensity(mask, splitRect);
                     var splitScore = MathF.Min(0.95f,
@@ -969,6 +976,15 @@ internal sealed class OpenCvSealCandidateDetector
     {
         using var roi = new Mat(mask, rect);
         return Cv2.CountNonZero(roi) / (Single)Math.Max(1, rect.Width * rect.Height);
+    }
+
+    private static Single ComputeSaturationDensity(Mat roi)
+    {
+        using var hsv = new Mat();
+        using var saturated = new Mat();
+        Cv2.CvtColor(roi, hsv, ColorConversionCodes.BGR2HSV);
+        Cv2.InRange(hsv, new Scalar(0, 35, 0), new Scalar(180, 255, 255), saturated);
+        return Cv2.CountNonZero(saturated) / (Single)Math.Max(1, roi.Width * roi.Height);
     }
 
     private static List<SealDetection> FilterNeutralDetectionsNearRed(IReadOnlyList<SealDetection> redDetections, IReadOnlyList<SealDetection> neutralDetections)
