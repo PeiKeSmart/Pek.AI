@@ -586,43 +586,135 @@ internal static class PdfPageRasterizer
 
 internal sealed class OpenCvSealCandidateDetector
 {
+    private static readonly Boolean DebugCandidateLoggingEnabled = String.Equals(Environment.GetEnvironmentVariable("PEK_STAMP_DEBUG"), "1", StringComparison.Ordinal);
+
     public IReadOnlyList<SealDetection> Detect(Mat source)
     {
         using var redMask = BuildRedSealMask(source);
-        var redDetections = DetectFromMask(source, redMask, channelName: "opencv-red", allowPartial: true);
+        var redDetections = DetectFromMask(source, redMask, channelName: "opencv-red", allowPartial: true).ToList();
 
         using var neutralMask = BuildNeutralSealMask(source);
-        var neutralDetections = DetectFromMask(source, neutralMask, channelName: "opencv-neutral", allowPartial: true);
+        var neutralDetections = DetectFromMask(source, neutralMask, channelName: "opencv-neutral", allowPartial: true).ToList();
 
-        if (redDetections.Count > 0)
-            neutralDetections = FilterNeutralDetectionsNearRed(redDetections, neutralDetections);
+        var promotedRedDetections = neutralDetections
+            .Where(item => item.Source.Contains("opencv-red-support", StringComparison.Ordinal))
+            .ToList();
+        if (promotedRedDetections.Count > 0)
+        {
+            redDetections.AddRange(promotedRedDetections);
+            neutralDetections = neutralDetections
+                .Where(item => !item.Source.Contains("opencv-red-support", StringComparison.Ordinal))
+                .ToList();
+        }
+
+        if (DebugCandidateLoggingEnabled)
+        {
+            WriteDebugDetections("red/raw", redDetections);
+            WriteDebugDetections("neutral/raw", neutralDetections);
+        }
+
+        var reliableRedDetections = redDetections.Where(IsReliableRedAnchor).ToList();
+        if (reliableRedDetections.Count > 0)
+            neutralDetections = FilterNeutralDetectionsNearRed(reliableRedDetections, neutralDetections);
+
+        if (DebugCandidateLoggingEnabled)
+            WriteDebugDetections("neutral/filtered", neutralDetections);
 
         var detections = new List<SealDetection>(redDetections.Count + neutralDetections.Count);
         detections.AddRange(redDetections);
         detections.AddRange(neutralDetections);
 
         var filtered = NonMaxSuppression.Apply(detections, 0.3f);
-        return MergeNearbyDetections(filtered, source.Width, source.Height);
+        var merged = MergeNearbyDetections(filtered, source.Width, source.Height);
+
+        if (DebugCandidateLoggingEnabled)
+            WriteDebugDetections("merged", merged);
+
+        return merged;
+    }
+
+    private static void WriteDebugDetections(String stage, IReadOnlyList<SealDetection> detections)
+    {
+        Console.WriteLine($"[debug] {stage} count={detections.Count}");
+
+        foreach (var detection in detections)
+        {
+            Console.WriteLine($"[debug] {stage} source={detection.Source} label={detection.Label} rect=({detection.Box.X},{detection.Box.Y},{detection.Box.Width},{detection.Box.Height}) score={detection.Score:0.000}");
+        }
+    }
+
+    private static Boolean IsReliableRedAnchor(SealDetection detection)
+    {
+        if (!detection.Source.Contains("opencv-red", StringComparison.Ordinal))
+            return false;
+
+        var area = detection.Box.Width * detection.Box.Height;
+        var minimumSide = Math.Min(detection.Box.Width, detection.Box.Height);
+        var maximumSide = Math.Max(detection.Box.Width, detection.Box.Height);
+        return area >= 1200 || (minimumSide >= 24 && maximumSide >= 48);
     }
 
     private static Mat BuildRedSealMask(Mat source)
     {
         using var hsv = new Mat();
-        using var mask1 = new Mat();
-        using var mask2 = new Mat();
+        using var strictMask1 = new Mat();
+        using var strictMask2 = new Mat();
+        using var relaxedMask1 = new Mat();
+        using var relaxedMask2 = new Mat();
+        using var relaxedHueMask = new Mat();
+        using var redDominantMask = BuildRedDominantMask(source);
         var mask = new Mat();
         using var morph = new Mat();
 
         Cv2.CvtColor(source, hsv, ColorConversionCodes.BGR2HSV);
-        Cv2.InRange(hsv, new Scalar(0, 80, 60), new Scalar(15, 255, 255), mask1);
-        Cv2.InRange(hsv, new Scalar(160, 80, 60), new Scalar(180, 255, 255), mask2);
-        Cv2.BitwiseOr(mask1, mask2, mask);
+        Cv2.InRange(hsv, new Scalar(0, 80, 60), new Scalar(15, 255, 255), strictMask1);
+        Cv2.InRange(hsv, new Scalar(160, 80, 60), new Scalar(180, 255, 255), strictMask2);
+        Cv2.BitwiseOr(strictMask1, strictMask2, mask);
+
+        // 扫描件里的浅红章经常饱和度偏低，单靠严格 HSV 会漏掉，需要附加一层红通道占优约束。
+        Cv2.InRange(hsv, new Scalar(0, 20, 95), new Scalar(18, 255, 255), relaxedMask1);
+        Cv2.InRange(hsv, new Scalar(150, 20, 95), new Scalar(180, 255, 255), relaxedMask2);
+        Cv2.BitwiseOr(relaxedMask1, relaxedMask2, relaxedHueMask);
+        Cv2.BitwiseAnd(relaxedHueMask, redDominantMask, relaxedHueMask);
+        Cv2.BitwiseOr(mask, relaxedHueMask, mask);
 
         using var kernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new Size(5, 5));
         Cv2.MorphologyEx(mask, morph, MorphTypes.Close, kernel, iterations: 2);
         Cv2.MorphologyEx(morph, morph, MorphTypes.Open, kernel, iterations: 1);
         morph.CopyTo(mask);
         return mask;
+    }
+
+    private static Mat BuildRedDominantMask(Mat source)
+    {
+        var channels = Cv2.Split(source);
+
+        try
+        {
+            using var redMinusGreen = new Mat();
+            using var redMinusBlue = new Mat();
+            using var redDominatesGreen = new Mat();
+            using var redDominatesBlue = new Mat();
+            using var redBrightMask = new Mat();
+            var mask = new Mat();
+
+            Cv2.Subtract(channels[2], channels[1], redMinusGreen);
+            Cv2.Subtract(channels[2], channels[0], redMinusBlue);
+            Cv2.Compare(redMinusGreen, new Scalar(12), redDominatesGreen, CmpType.GT);
+            Cv2.Compare(redMinusBlue, new Scalar(12), redDominatesBlue, CmpType.GT);
+            Cv2.Compare(channels[2], new Scalar(90), redBrightMask, CmpType.GT);
+
+            Cv2.BitwiseAnd(redDominatesGreen, redDominatesBlue, mask);
+            Cv2.BitwiseAnd(mask, redBrightMask, mask);
+            return mask;
+        }
+        finally
+        {
+            foreach (var channel in channels)
+            {
+                channel.Dispose();
+            }
+        }
     }
 
     private static Mat BuildNeutralSealMask(Mat source)
@@ -712,6 +804,10 @@ internal sealed class OpenCvSealCandidateDetector
             if (edgeDensity < 0.015f && strokeDensity < 0.04f)
                 continue;
 
+            var redDominanceDensity = ComputeRedDominanceDensity(roi);
+            if (String.Equals(channelName, "opencv-red", StringComparison.Ordinal) && redDominanceDensity < (partialCandidate ? 0.035f : 0.075f))
+                continue;
+
             var saturationDensity = isNeutralChannel
                 ? ComputeSaturationDensity(roi)
                 : 0f;
@@ -730,15 +826,23 @@ internal sealed class OpenCvSealCandidateDetector
             score += MathF.Min(0.2f, fillRatio * 0.3f);
             score += MathF.Min(0.2f, edgeDensity * 1.4f);
             score += MathF.Min(0.2f, strokeDensity * 0.8f);
+            score += MathF.Min(0.18f, redDominanceDensity * 1.6f);
             score += MathF.Min(0.15f, saturationDensity * 1.8f);
             score += MathF.Min(0.18f, grayscaleStructureScore * 0.18f);
+
+            var promotedRedSupport = isNeutralChannel && !partialCandidate && redDominanceDensity >= 0.14f;
+            if (promotedRedSupport)
+                score = MathF.Max(score, 0.82f);
+
             if (partialCandidate)
                 score = MathF.Max(score, 0.38f);
 
             var finalRect = partialCandidate && String.Equals(channelName, "opencv-red", StringComparison.Ordinal)
                 ? ExpandPartialDetectionRect(rect, source.Width, source.Height)
                 : rect;
-            var detectionSource = grayscaleStructureScore > 0f ? "opencv-gray" : channelName;
+            var detectionSource = promotedRedSupport
+                ? "opencv-red-support"
+                : grayscaleStructureScore > 0f ? "opencv-gray" : channelName;
 
             if (TrySplitMergedRedDetection(mask, finalRect, channelName, partialCandidate, minimumSealSide, out var splitRects))
             {
@@ -999,6 +1103,38 @@ internal sealed class OpenCvSealCandidateDetector
         Cv2.CvtColor(roi, hsv, ColorConversionCodes.BGR2HSV);
         Cv2.InRange(hsv, new Scalar(0, 35, 0), new Scalar(180, 255, 255), saturated);
         return Cv2.CountNonZero(saturated) / (Single)Math.Max(1, roi.Width * roi.Height);
+    }
+
+    private static Single ComputeRedDominanceDensity(Mat roi)
+    {
+        var channels = Cv2.Split(roi);
+
+        try
+        {
+            using var redMinusGreen = new Mat();
+            using var redMinusBlue = new Mat();
+            using var redDominatesGreen = new Mat();
+            using var redDominatesBlue = new Mat();
+            using var redBrightMask = new Mat();
+            using var redMask = new Mat();
+
+            Cv2.Subtract(channels[2], channels[1], redMinusGreen);
+            Cv2.Subtract(channels[2], channels[0], redMinusBlue);
+            Cv2.Compare(redMinusGreen, new Scalar(12), redDominatesGreen, CmpType.GT);
+            Cv2.Compare(redMinusBlue, new Scalar(12), redDominatesBlue, CmpType.GT);
+            Cv2.Compare(channels[2], new Scalar(90), redBrightMask, CmpType.GT);
+
+            Cv2.BitwiseAnd(redDominatesGreen, redDominatesBlue, redMask);
+            Cv2.BitwiseAnd(redMask, redBrightMask, redMask);
+            return Cv2.CountNonZero(redMask) / (Single)Math.Max(1, roi.Width * roi.Height);
+        }
+        finally
+        {
+            foreach (var channel in channels)
+            {
+                channel.Dispose();
+            }
+        }
     }
 
     private static Single ComputeGrayscaleSealScore(Mat mask, Rect rect, Single aspectRatio, Double circularity, Single fillRatio, Single edgeDensity, Single strokeDensity, Single holeRatio)
